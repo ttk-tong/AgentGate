@@ -11,7 +11,15 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 EventType = Literal[
-    "token", "tool_call", "tool_result", "usage", "done", "error", "compact", "subagent"
+    "token",
+    "tool_call",
+    "tool_result",
+    "tool_confirmation",
+    "usage",
+    "done",
+    "error",
+    "compact",
+    "subagent",
 ]
 
 
@@ -43,3 +51,36 @@ class Event(BaseModel):
     @staticmethod
     def error(message: str, retryable: bool, seq: int) -> "Event":
         return Event(type="error", data={"message": message, "retryable": retryable}, seq=seq)
+
+    @staticmethod
+    def tool_call(tool_call_id: str, name: str, arguments: dict, seq: int) -> "Event":
+        return Event(
+            type="tool_call",
+            data={"tool_call_id": tool_call_id, "name": name, "arguments": arguments},
+            seq=seq,
+        )
+
+    @staticmethod
+    def tool_result(
+        tool_call_id: str, name: str, ok: bool, display, seq: int
+    ) -> "Event":
+        return Event(
+            type="tool_result",
+            data={"tool_call_id": tool_call_id, "name": name, "ok": ok, "display": display},
+            seq=seq,
+        )
+
+    @staticmethod
+    def tool_confirmation(
+        tool_call_id: str, name: str, arguments: dict, reason: str | None, seq: int
+    ) -> "Event":
+        return Event(
+            type="tool_confirmation",
+            data={
+                "tool_call_id": tool_call_id,
+                "name": name,
+                "arguments": arguments,
+                "reason": reason,
+            },
+            seq=seq,
+        )

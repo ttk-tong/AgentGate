@@ -1,10 +1,12 @@
 """OpenAI 兼容 Chat Completions 流式适配器。
 
 适配任何 OpenAI 兼容端点（如 DeepSeek 代理）：走 POST {base_url}/chat/completions，
-鉴权用 Authorization: Bearer，SSE 里 choices[].delta.content 带增量文本。
+鉴权用 Authorization: Bearer，SSE 里 choices[].delta.content 带增量文本、
+choices[].delta.tool_calls 带增量工具调用。
 
-阶段 1 只实现 stream。不做路由/降级/重试——那是上层（plan/01、02）的职责。
-未配置 key/base_url 时不在此静默降级：由工厂（factory.py）决定用 Mock。
+阶段 2 新增：解析流式 tool_calls（按 index 累积 name/arguments 片段），
+把 assistant 的工具调用与 tool 角色结果渲染回 OpenAI 消息格式，payload 带 tools。
+不做路由/降级/重试——那是上层（plan/01、02）的职责。
 """
 from __future__ import annotations
 
@@ -14,7 +16,7 @@ from collections.abc import AsyncIterator
 import httpx
 
 from app.domain.enums import Role
-from app.domain.llm import LLMRequest, StreamChunk, Usage
+from app.domain.llm import LLMMessage, LLMRequest, StreamChunk, ToolCall, Usage
 
 
 class OpenAICompatProvider:
@@ -35,6 +37,8 @@ class OpenAICompatProvider:
 
         finish_reason = "stop"
         usage = Usage()
+        # 流式 tool_calls 按 index 累积：{index: {"id","name","args_str"}}
+        tool_acc: dict[int, dict] = {}
 
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             async with client.stream("POST", url, headers=headers, json=payload) as resp:
@@ -47,7 +51,6 @@ class OpenAICompatProvider:
                         continue
                     evt = json.loads(data)
 
-                    # 用量：兼容端点通常在末帧（含 stream_options.include_usage 时）带 usage
                     u = evt.get("usage")
                     if u:
                         usage.input_tokens = u.get("prompt_tokens", 0)
@@ -58,23 +61,28 @@ class OpenAICompatProvider:
                         text = delta.get("content")
                         if text:
                             yield StreamChunk(type="text", text=text)
+                        for tc in delta.get("tool_calls", []) or []:
+                            _accumulate_tool_call(tool_acc, tc)
                         fr = choice.get("finish_reason")
                         if fr:
                             finish_reason = _map_finish_reason(fr)
+
+        # 工具调用整块累积完成后统一产出（arguments 需完整 JSON 才能解析）
+        for idx in sorted(tool_acc):
+            call = _finalize_tool_call(tool_acc[idx], idx)
+            if call is not None:
+                yield StreamChunk(type="tool_call", tool_call=call)
 
         yield StreamChunk(type="usage", usage=usage)
         yield StreamChunk(type="finish", finish_reason=finish_reason)
 
     def _build_payload(self, request: LLMRequest) -> dict:
-        # OpenAI 兼容：system 作为 messages 首条，其余按 user/assistant 排列
         messages: list[dict] = []
         if request.system:
             messages.append({"role": "system", "content": request.system})
-        messages.extend(
-            {"role": _map_role(m.role), "content": m.content}
-            for m in request.messages
-            if m.role in (Role.user, Role.assistant)
-        )
+        for m in request.messages:
+            messages.extend(_render_message(m))
+
         payload: dict = {
             "model": request.model,
             "max_tokens": request.max_tokens,
@@ -84,7 +92,68 @@ class OpenAICompatProvider:
             # 请求末帧带用量（多数 OpenAI 兼容端点支持；不支持则忽略）
             "stream_options": {"include_usage": True},
         }
+        if request.tools:
+            payload["tools"] = request.tools
         return payload
+
+
+def _render_message(m: LLMMessage) -> list[dict]:
+    """把一条领域消息渲染成 OpenAI 消息格式（工具结果会展开成多条 tool 消息）。"""
+    # 工具结果：role=tool，每条结果单独一条消息，用 tool_call_id 对应
+    if m.tool_results:
+        return [
+            {"role": "tool", "tool_call_id": r.tool_call_id, "content": r.content}
+            for r in m.tool_results
+        ]
+
+    # assistant 发起工具调用
+    if m.role == Role.assistant and m.tool_calls:
+        return [
+            {
+                "role": "assistant",
+                "content": m.content or None,
+                "tool_calls": [
+                    {
+                        "id": c.id,
+                        "type": "function",
+                        "function": {
+                            "name": c.name,
+                            "arguments": json.dumps(c.arguments, ensure_ascii=False),
+                        },
+                    }
+                    for c in m.tool_calls
+                ],
+            }
+        ]
+
+    return [{"role": _map_role(m.role), "content": m.content}]
+
+
+def _accumulate_tool_call(acc: dict[int, dict], tc: dict) -> None:
+    """把一个流式 tool_call 片段并入按 index 的累积器。"""
+    idx = tc.get("index", 0)
+    slot = acc.setdefault(idx, {"id": None, "name": None, "args_str": ""})
+    if tc.get("id"):
+        slot["id"] = tc["id"]
+    fn = tc.get("function", {})
+    if fn.get("name"):
+        slot["name"] = fn["name"]
+    if fn.get("arguments"):
+        slot["args_str"] += fn["arguments"]
+
+
+def _finalize_tool_call(slot: dict, idx: int) -> ToolCall | None:
+    if not slot.get("name"):
+        return None
+    try:
+        args = json.loads(slot["args_str"]) if slot["args_str"] else {}
+    except json.JSONDecodeError:
+        args = {}
+    return ToolCall(
+        id=slot.get("id") or f"call_{idx}",
+        name=slot["name"],
+        arguments=args if isinstance(args, dict) else {},
+    )
 
 
 def _map_role(role: Role) -> str:

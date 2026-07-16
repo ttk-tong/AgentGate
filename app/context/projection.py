@@ -16,7 +16,7 @@ from __future__ import annotations
 from uuid import UUID
 
 from app.domain.enums import EventKind, Role
-from app.domain.llm import LLMMessage
+from app.domain.llm import LLMMessage, ToolCall, ToolResultMessage
 from app.domain.models import ContentBlock, SessionEvent
 
 
@@ -76,17 +76,30 @@ def _merge_and_render(chain: list[SessionEvent]) -> list[LLMMessage]:
             continue  # title/mode/snapshot 等不进入 LLM 上下文
 
         text = _render_content(ev.content)
+        tool_calls = _render_tool_calls(ev.content)
+        tool_results = _render_tool_results(ev.content)
 
         # 并行兄弟归并：同 message_id 且同 role，合并到已有消息
+        # （并行工具场景：一次响应的多个 tool_use 块共享 message_id）
         if ev.message_id is not None and ev.message_id in group_index:
             idx = group_index[ev.message_id]
             existing = messages[idx]
             if existing.role == ev.role:
-                merged = existing.content + ("\n" + text if text else "")
-                messages[idx] = LLMMessage(role=existing.role, content=merged)
+                merged_text = existing.content + ("\n" + text if text else "")
+                messages[idx] = LLMMessage(
+                    role=existing.role,
+                    content=merged_text,
+                    tool_calls=existing.tool_calls + tool_calls,
+                    tool_results=existing.tool_results + tool_results,
+                )
                 continue
 
-        msg = LLMMessage(role=ev.role, content=text)
+        msg = LLMMessage(
+            role=ev.role,
+            content=text,
+            tool_calls=tool_calls,
+            tool_results=tool_results,
+        )
         messages.append(msg)
         if ev.message_id is not None:
             group_index[ev.message_id] = len(messages) - 1
@@ -95,11 +108,51 @@ def _merge_and_render(chain: list[SessionEvent]) -> list[LLMMessage]:
 
 
 def _render_content(content: list[ContentBlock] | None) -> str:
-    """阶段 1 只处理 text 块，拼成纯文本。"""
+    """拼接 text 块为纯文本（tool_use / tool_result 块另行处理）。"""
     if not content:
         return ""
     parts = [b.text for b in content if b.type == "text" and b.text]
     return "\n".join(parts)
+
+
+def _render_tool_calls(content: list[ContentBlock] | None) -> list[ToolCall]:
+    """从 tool_use 块还原模型发起的工具调用（阶段 2）。"""
+    if not content:
+        return []
+    calls = []
+    for b in content:
+        if b.type == "tool_use" and b.tool_call_id and b.tool_name:
+            calls.append(
+                ToolCall(id=b.tool_call_id, name=b.tool_name, arguments=b.arguments or {})
+            )
+    return calls
+
+
+def _render_tool_results(content: list[ContentBlock] | None) -> list[ToolResultMessage]:
+    """从 tool_result 块还原回填给模型的工具结果（阶段 2）。"""
+    if not content:
+        return []
+    results = []
+    for b in content:
+        if b.type == "tool_result" and b.tool_call_id:
+            results.append(
+                ToolResultMessage(
+                    tool_call_id=b.tool_call_id,
+                    content=_stringify(b.result),
+                    is_error=b.is_error,
+                )
+            )
+    return results
+
+
+def _stringify(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    import json
+
+    return json.dumps(value, ensure_ascii=False, default=str)
 
 
 def _boundary_text(ev: SessionEvent) -> str:

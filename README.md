@@ -71,8 +71,22 @@ tests/                     # 冒烟测试
 
 完成标志：`POST /v1/sessions/{id}/messages` 发一句话 → 落库成 DAG 事件 → 返回模型回复（流式/非流式）。
 
-配置 `ANTHROPIC_API_KEY` 后自动切换到真实模型；留空则用 Mock 回声。
+配置 `ANTHROPIC_API_KEY` 或 OpenAI 兼容端点（`OPENAI_BASE_URL` + `OPENAI_API_KEY`）后自动切换到真实模型；留空则用 Mock 回声。
 
-## 下一步（阶段 2）
+## 阶段 2：工具（读写分批，已完成）
 
-工具注册与执行（读并行/写串行）、`finish=tool_use` 分支接入、工具结果回填 DAG。
+模型可并行调多个只读工具、串行调写工具，副作用无竞态：
+
+- **工具契约**（`domain/tool.py`）：`ToolSpec`（含 `is_read_only` / `is_concurrency_safe` / `mutates_context` / `dangerous` 读写与危险属性）+ 三段式执行体（`validate_input` 模型面校验 / `check_permissions` 系统面权限 / `call` 执行）+ `ContextMutation`（副作用）。
+- **注册表 + 内置工具**（`orchestration/tools/`）：`ToolRegistry` + 两个只读工具（`file_read`、`kb_search` 桩，可并行）+ 一个写工具（`note_append`，串行）。
+- **读写分批执行器**（`orchestration/tool_executor.py`，本阶段核心）：`partition_tool_calls` 把连续只读工具并成「可并发批」、写/未知/不安全工具单独成「串行批」；并发批并行执行但 `ContextMutation` **延迟到批结束后按模型原始调用顺序串行应用**，避免竞态。
+- **Loop 接入**（`orchestration/agent_loop.py`）：`TOOL_EXEC` 转移、结果回填 DAG（`tool_use` / `tool_result` 块）、`max_tool_calls` guard。
+- **两段式关卡 + 人工确认**：`dangerous` 工具挂起会话为 `waiting_confirmation`，产出 `tool_confirmation` 事件、待执行调用存 Redis；`POST /v1/sessions/{id}/confirmations` 批准/拒绝后恢复运行。
+
+完成标志：模型能并行调多个只读工具、串行调写工具，副作用按序应用一次且无竞态。
+
+测试：`tests/test_tool_executor.py`（分批 + 延迟按序应用单测，无 DB）、`tests/test_tool_e2e.py`（Mock 脚本化工具调用的端到端，含确认流程）。Mock 脚本语法：user 文本里写 `[[tool:name arg=v | name2 arg=v]]` 触发一轮工具调用。
+
+## 下一步（阶段 3）
+
+上下文预算与压缩（`compact_boundary` 生成）、max-output 恢复、模型降级链。

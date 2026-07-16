@@ -27,6 +27,7 @@ class ContentBlock(BaseModel):
     tool_call_id: str | None = None
     arguments: dict[str, Any] | None = None
     result: Any | None = None
+    is_error: bool = False  # tool_result 块：该结果是否为错误（回填给模型时标注）
     # image 块：阶段 6 多模态启用，此处先留字段
     image_url: str | None = None
 

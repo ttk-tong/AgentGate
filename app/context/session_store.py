@@ -11,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.context.projection import project_context
-from app.domain.enums import EventKind, Role
+from app.domain.enums import EventKind, Role, SessionState
 from app.domain.llm import LLMMessage
 from app.domain.models import ContentBlock, Session, SessionEvent
 from app.persistence.tables import SessionEventRow, SessionRow
@@ -92,6 +92,30 @@ class SessionStore:
     async def get_session(self, session_id: uuid.UUID) -> Session | None:
         row = await self.db.get(SessionRow, session_id)
         return _session_to_domain(row) if row else None
+
+    async def set_state(self, session_id: uuid.UUID, state: "SessionState") -> None:
+        """更新会话状态（如挂起等待人工确认 waiting_confirmation，见 plan/04 §6）。"""
+        sess = await self.db.get(SessionRow, session_id)
+        if sess is None:
+            raise ValueError(f"session not found: {session_id}")
+        sess.status = state.value
+        await self.db.flush()
+
+    async def append_note(self, session_id: uuid.UUID, text: str) -> None:
+        """把一条便签追加到 session.meta["notes"]（note_append 工具的副作用落点）。
+
+        写工具的副作用经此落库。放在 meta 里便于测试直接读取、验证「按调用顺序
+        应用、无竞态」——并发批里的写工具会被 partition 拆成串行批，顺序确定。
+        """
+        sess = await self.db.get(SessionRow, session_id)
+        if sess is None:
+            raise ValueError(f"session not found: {session_id}")
+        meta = dict(sess.meta or {})
+        notes = list(meta.get("notes", []))
+        notes.append(text)
+        meta["notes"] = notes
+        sess.meta = meta
+        await self.db.flush()
 
     async def load_projection(self, session_id: uuid.UUID) -> list[LLMMessage]:
         """读全部事件并投影为 LLM 消息序列（见 projection.project_context）。
