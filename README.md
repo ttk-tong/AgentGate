@@ -59,6 +59,20 @@ alembic/                   # 迁移
 tests/                     # 冒烟测试
 ```
 
-## 下一步（阶段 1）
+## 阶段 1：事件 DAG + 最小 Loop（已完成）
 
-事件 DAG 投影（边界截断 + 并行兄弟归并）、Provider 适配器、最小 Agent Loop、`/messages` 端到端闭环。
+不带工具的对话端到端闭环（walking skeleton）：
+
+- **DAG 投影**（`context/projection.py`）：父指针回溯 + `compact_boundary` 截断 + 按 `message_id` 归并并行兄弟节点 + 环检测 + sidechain 排除。纯函数，单测覆盖。
+- **Provider 适配器**（`routing/providers/`）：Anthropic 流式 SSE 解析；无 API key 时用 Mock，保证无网络也能跑通。
+- **最小 Agent Loop**（`orchestration/agent_loop.py`）：显式状态机 `PRE_CALL → LLM_CALL → STOP → DONE`，命名转移与恢复 guard 字段一步到位（工具/压缩/降级分支预留）。
+- **API**（`api/v1/chat.py`）：`POST /v1/sessions`、`.../messages`（非流式）、`.../messages/stream`（SSE）。
+- **会话串行锁**（`orchestration/session_lock.py`）：`lock:session:{id}`，Redis SET NX + Lua 校验释放。
+
+完成标志：`POST /v1/sessions/{id}/messages` 发一句话 → 落库成 DAG 事件 → 返回模型回复（流式/非流式）。
+
+配置 `ANTHROPIC_API_KEY` 后自动切换到真实模型；留空则用 Mock 回声。
+
+## 下一步（阶段 2）
+
+工具注册与执行（读并行/写串行）、`finish=tool_use` 分支接入、工具结果回填 DAG。

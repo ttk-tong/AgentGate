@@ -25,8 +25,13 @@ class Settings(BaseSettings):
     )
     redis_url: str = Field(default="redis://localhost:6379/0")
 
-    # —— Provider（阶段 0 占位，后续阶段接入）——
+    # —— Provider ——
     anthropic_api_key: str = ""
+    # OpenAI 兼容端点（如 DeepSeek 代理）：base_url 需含 /v1，走 /chat/completions
+    openai_base_url: str = ""
+    openai_api_key: str = ""
+    default_model: str = "claude-opus-4-8"
+    default_system_prompt: str = "你是 AgentGate，一个有帮助的 AI 助手。"
 
 
 @lru_cache

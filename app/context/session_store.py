@@ -1,7 +1,7 @@
 """会话与事件 DAG 的读写。
 
-阶段 0：只实现最小能力——创建会话、append 事件（维护 parent 指针与 seq）、
-按 session 读回事件。完整的 DAG 投影（边界截断 + 并行兄弟归并）在阶段 1 实现。
+阶段 1：创建会话、append 事件（维护 parent 指针与 seq）、读回事件，
+并通过 projection.project_context 投影出 LLM 消息序列。
 """
 from __future__ import annotations
 
@@ -10,8 +10,10 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.context.projection import project_context
 from app.domain.enums import EventKind, Role
-from app.domain.models import ContentBlock, SessionEvent
+from app.domain.llm import LLMMessage
+from app.domain.models import ContentBlock, Session, SessionEvent
 from app.persistence.tables import SessionEventRow, SessionRow
 
 
@@ -77,7 +79,7 @@ class SessionStore:
         return row.id
 
     async def list_events(self, session_id: uuid.UUID) -> list[SessionEvent]:
-        """按 seq 顺序读回全部事件（阶段 0 的简单读取）。"""
+        """按 seq 顺序读回全部事件。"""
         rows = (
             await self.db.scalars(
                 select(SessionEventRow)
@@ -86,6 +88,44 @@ class SessionStore:
             )
         ).all()
         return [_to_domain(r) for r in rows]
+
+    async def get_session(self, session_id: uuid.UUID) -> Session | None:
+        row = await self.db.get(SessionRow, session_id)
+        return _session_to_domain(row) if row else None
+
+    async def load_projection(self, session_id: uuid.UUID) -> list[LLMMessage]:
+        """读全部事件并投影为 LLM 消息序列（见 projection.project_context）。
+
+        阶段 1 直接读全量；大会话优化（从 head 沿 parent 回溯 + 边界截断的
+        SQL/缓存路径）留待后续。
+        """
+        sess = await self.db.get(SessionRow, session_id)
+        if sess is None:
+            return []
+        events = await self.list_events(session_id)
+        return project_context(events, sess.head_event_id)
+
+
+def _session_to_domain(r: SessionRow) -> Session:
+    from app.domain.enums import SessionState
+
+    return Session(
+        id=r.id,
+        tenant_id=r.tenant_id,
+        agent_id=r.agent_id,
+        external_user=r.external_user,
+        title=r.title,
+        state=SessionState(r.status),
+        model=r.model,
+        effective_context_window=r.effective_context_window,
+        token_usage=r.token_usage or {},
+        head_event_id=r.head_event_id,
+        last_boundary_id=r.last_boundary_id,
+        active_compaction=r.active_compaction,
+        metadata=r.meta or {},
+        created_at=r.created_at,
+        updated_at=r.updated_at,
+    )
 
 
 def _dump_content(content: list[ContentBlock] | None) -> dict | None:
