@@ -25,7 +25,7 @@ from app.context.context_builder import (
 )
 from app.context.session_store import SessionStore
 from app.domain.enums import EventKind, Role, SessionState
-from app.domain.errors import PromptTooLong
+from app.domain.errors import PromptTooLong, ProviderOverloaded, ProviderUnavailable
 from app.domain.events import Event
 from app.domain.llm import LLMRequest, ToolCall, Usage
 from app.domain.models import ContentBlock
@@ -37,6 +37,7 @@ from app.orchestration.state import (
     STOP_MAX_TOOL_CALLS,
     STOP_MAX_TURNS,
     STOP_PROMPT_TOO_LONG,
+    STOP_PROVIDER_UNAVAILABLE,
     STOP_TIMEOUT,
     LoopConfig,
     LoopPhase,
@@ -74,6 +75,7 @@ class AgentLoop:
         enabled_tools: list[str] | None = None,
         summarizer: Provider | None = None,
         summary_model: str | None = None,
+        fallback_models: list[str] | None = None,
     ):
         self.store = store
         self.provider = provider
@@ -86,11 +88,23 @@ class AgentLoop:
         # 全量摘要压缩用的（低成本）模型；默认复用主 provider 与主模型
         self.summarizer = summarizer or provider
         self.summary_model = summary_model or model
+        # 过载时的模型降级链（同一 provider 换模型重跑，plan/03 §5）
+        self.fallback_models = fallback_models or []
 
     def _tools_schema(self) -> list[dict]:
         if self.registry is None:
             return []
         return self.registry.to_openai_schema(self.enabled_tools)
+
+    def _effective_max_tokens(self, st: LoopState) -> int:
+        """本轮请求的 max_tokens。max-output 恢复时按恢复次数递增上限（plan/03 §4）。
+
+        每恢复一次翻倍（有 cap），给模型更多空间把被截断的内容写完。
+        """
+        base = self.cfg.max_tokens
+        if st.output_recovery_count == 0:
+            return base
+        return min(base * (2 ** st.output_recovery_count), base * 4)
 
     async def run(self, session_id, user_text: str) -> AsyncIterator[Event]:
         """驱动一次用户输入的完整运行，产出对外 Event 流。"""
@@ -192,24 +206,28 @@ class AgentLoop:
 
             messages = await self.store.load_projection(session_id)
             request = LLMRequest(
-                model=self.model,
+                model=st.current_model,
                 system=self.system_prompt,
                 messages=messages,
-                max_tokens=self.cfg.max_tokens,
+                max_tokens=self._effective_max_tokens(st),
                 tools=tools_schema,
             )
 
             # —— LLM_CALL：流式累积文本 + 工具调用 ——
-            # 413 prompt_too_long → 反应式压缩兜底，一次性 guard 防死循环（03 §4）
+            # 每条恢复路径（413 压缩 / 过载降级 / 截断恢复）都带一次性或有上限的
+            # guard，防死循环（plan/03 §4）。错误抑制：首字节前失败可安全重跑本轮；
+            # 已产出 token 后失败不再吞（客户端已收到部分内容）。
             st.phase = LoopPhase.llm_call
             text_acc = ""
             tool_calls: list[ToolCall] = []
             call_usage = Usage()
             finish_reason = "stop"
+            emitted_any = False
             try:
                 async for chunk in self.provider.stream(request):
                     if chunk.type == "text" and chunk.text:
                         text_acc += chunk.text
+                        emitted_any = True
                         seq += 1
                         yield Event.token(chunk.text, seq)
                     elif chunk.type == "tool_call" and chunk.tool_call:
@@ -234,6 +252,29 @@ class AgentLoop:
                 yield Event(type="compact", data={"layer": "reactive", "freed_tokens": freed}, seq=seq)
                 # text_acc 尚未落库（本轮 LLM 调用未完成），直接重跑本轮
                 st.turn -= 1  # 本轮不计数：413 未产出任何 assistant 响应
+                continue
+            except ProviderOverloaded as e:
+                # 过载：首字节前才能安全重跑（错误抑制，plan/02 §3.2）。
+                # 已产出 token → 不可重试，以 error 帧结束。
+                if emitted_any:
+                    seq += 1
+                    yield Event.error(f"provider overloaded mid-stream: {e}", retryable=False, seq=seq)
+                    return
+                # 模型降级重跑，次数上限 guard（plan/03 §5）
+                if st.model_fallbacks_used >= len(self.fallback_models):
+                    yield _abort(st, STOP_PROVIDER_UNAVAILABLE, seq)
+                    return
+                next_model = self.fallback_models[st.model_fallbacks_used]
+                st.model_fallbacks_used += 1
+                log.warning(
+                    "model_fallback",
+                    session_id=str(session_id),
+                    from_model=st.current_model,
+                    to_model=next_model,
+                    used=st.model_fallbacks_used,
+                )
+                st.current_model = next_model
+                st.turn -= 1  # 本轮不计数：过载未产出响应
                 continue
 
             st.usage = st.usage + call_usage
@@ -262,6 +303,26 @@ class AgentLoop:
                 message_id=message_id,
             )
             st.head_event_id = head_id
+
+            # —— max-output 恢复：被截断且未耗尽次数 → 升 max_tokens 后续写（plan/03 §4）——
+            # 已落库的部分响应会进入下一轮投影，模型据此继续；带次数上限 guard。
+            if finish_reason == "max_tokens":
+                if st.output_recovery_count < self.cfg.max_output_recovery:
+                    st.output_recovery_count += 1
+                    log.info(
+                        "output_recovery",
+                        session_id=str(session_id),
+                        count=st.output_recovery_count,
+                    )
+                    st.turn -= 1  # 续写不计新轮次
+                    continue
+                # 恢复次数耗尽：当作自然结束收尾，不再无限升 token
+                st.phase = LoopPhase.done
+                st.status = "done"
+                st.stop_reason = STOP_COMPLETED
+                seq += 1
+                yield Event.done(STOP_COMPLETED, str(head_id), st.usage.model_dump(), seq)
+                return
 
             # —— 终止判定：模型这轮没调工具 = 自然结束 ——
             if finish_reason != "tool_use" or not tool_calls:

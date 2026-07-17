@@ -34,6 +34,17 @@ class Settings(BaseSettings):
     default_system_prompt: str = "你是 AgentGate，一个有帮助的 AI 助手。"
     # 全量摘要压缩用的低成本模型（plan/05 §7.3）；留空则复用主模型。
     summary_model: str = ""
+    # 过载时的模型降级链（逗号分隔，按序尝试）；留空则无降级（plan/03 §5）。
+    fallback_models: str = ""
+
+    # —— 认证/鉴权（plan/02）——
+    # API Key 哈希盐（服务端机密，不入库）。生产必须设置，dev 留默认。
+    auth_salt: str = "dev-insecure-salt-change-me"
+    # 是否强制认证。dev 默认关闭，方便本地无 key 调试；生产应设 true。
+    auth_required: bool = False
+
+    def fallback_model_list(self) -> list[str]:
+        return [m.strip() for m in self.fallback_models.split(",") if m.strip()]
 
 
 @lru_cache

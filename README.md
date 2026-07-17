@@ -103,6 +103,20 @@ tests/                     # 冒烟测试
 
 测试：`tests/test_context_budget.py`（tokenizer / 预算 / microcompact 规划单测，无 DB）、`tests/test_compaction.py`（microcompact 就地回收、`auto_compact` 设边界截断历史、边界后投影正确、熔断计数，DB 端到端）。
 
-## 下一步（阶段 4）
+## 阶段 4：韧性（Loop 恢复路径 + 路由，已完成）
 
-max-output 恢复、模型降级链、记忆固化（见 plan/06）。
+Provider 抖动/过载/截断时 Loop 能恢复或优雅降级，每条恢复路径都有 guard；认证、限流就位：
+
+- **认证/鉴权**（`security/`）：API Key（`ak_<prefix>_<secret>`，只存 `sha256(salt+secret)` 哈希 + 明文 prefix）→ `Principal`；`authz` 做 scope 校验 + 租户隔离硬校验（跨租户一律拒绝）。`AuthService` 依赖 `KeyStore` 协议（`DbKeyStore` 生产 / `InMemoryKeyStore` 测试），可离线单测。补 `tenant` / `api_key` 表。
+- **重试/熔断/降级链**（`resilience/`）：`backoff_delay`（指数退避 + 抖动 + 尊重 Retry-After，随机因子注入）；`CircuitBreaker`（每 Provider 一个，CLOSED→OPEN→HALF_OPEN，状态存可注入 store）；`call_with_retry`（单 target 内退避重试 → 耗尽换下个 target，熔断打开跳过，客户端错误立即抛）；`RetryPolicy.foreground()` / `background()` 区分前台后台激进度。`model_router` 按 policy 出首选 + 降级链、过滤熔断与能力不匹配。
+- **Loop 恢复路径**（`agent_loop.py`）：`ProviderOverloaded` → 模型降级重跑（`model_fallbacks_used` 上限 guard）；`finish_reason=max_tokens` → 升 `max_tokens` 续写（`output_recovery_count` 上限）；**错误抑制**——首字节前失败可安全重跑，已产出 token 后失败不吞、以 error 帧收尾。
+- **限流**（`resilience/rate_limit.py`）：租户 QPS 令牌桶（按时间匀速补桶，取不到给 Retry-After）+ 并发槽位上限（`concurrency_slot` 上下文管理器，异常路径也释放）。store 可注入（Redis 生产 / 内存测试）。
+- 时钟/随机源全部参数注入，纯逻辑不碰 IO —— 熔断、退避、限流、认证都能 `python -c` 或纯单测离线验证，不起 DB/Redis。
+
+完成标志：过载可降级重跑、截断可续写恢复、降级链耗尽映射 503、限流超额返回 429 + Retry-After，且每条自动重试/续跑路径都配一次性或有上限的 guard。
+
+测试（均离线，无需 DB/Redis）：`tests/test_auth.py`（密钥哈希/解析、过期吊销、scope、租户隔离）、`tests/test_resilience.py`（退避、熔断状态流转、降级链、限流补桶/并发）、`tests/test_model_router.py`（能力过滤、降级链、熔断剔除）；`tests/test_loop_recovery.py`（过载降级、max-output 恢复、错误抑制，DB 端到端）。
+
+## 下一步（阶段 5+）
+
+记忆固化与召回（见 plan/06）、技能系统（plan/07）、Prompt 装配（plan/08）、异步任务与调度（plan/09）。

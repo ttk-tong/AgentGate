@@ -19,16 +19,23 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import StreamingResponse
 
+from app.api.middleware.auth import enforce_rate_limit
 from app.config import get_settings
 from app.context.session_store import SessionStore
 from app.domain.events import Event
 from app.domain.llm import ToolCall
+from app.domain.principal import Principal
 from app.orchestration.agent_loop import AgentLoop, ConfirmationPending
 from app.orchestration.session_lock import SessionBusyError, session_lock
 from app.orchestration.tools import build_default_registry
 from app.persistence.db import get_db
 from app.persistence.redis_client import get_redis
 from app.routing.factory import get_provider
+
+# 主模型过载时的降级模型链（plan/03 §5）。逗号分隔配置解析而来。
+def _fallback_models() -> list[str]:
+    raw = get_settings().fallback_models
+    return [m.strip() for m in raw.split(",") if m.strip()]
 
 router = APIRouter(prefix="/v1", tags=["chat"])
 
@@ -68,6 +75,7 @@ class ConfirmationRequest(BaseModel):
 async def create_session(
     body: CreateSessionRequest,
     db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(enforce_rate_limit),
 ) -> CreateSessionResponse:
     store = SessionStore(db)
     sid = await store.create_session(external_user=body.external_user)
@@ -77,6 +85,8 @@ async def create_session(
 def _build_loop(db: AsyncSession) -> AgentLoop:
     settings = get_settings()
     store = SessionStore(db)
+    # 降级链：逗号分隔的模型名，过载时按序切换（plan/03 §5、02 §3.2）
+    fallbacks = [m.strip() for m in settings.fallback_models.split(",") if m.strip()]
     return AgentLoop(
         store=store,
         provider=get_provider(),
@@ -84,6 +94,7 @@ def _build_loop(db: AsyncSession) -> AgentLoop:
         system_prompt=settings.default_system_prompt,
         registry=build_default_registry(),
         summary_model=settings.summary_model or None,
+        fallback_models=fallbacks or None,
     )
 
 
@@ -111,6 +122,7 @@ async def post_message(
     body: MessageRequest,
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
+    principal: Principal = Depends(enforce_rate_limit),
 ) -> MessageResponse:
     """非流式：内部消费 Loop 事件流，聚合成一次性响应。"""
     await _ensure_session(db, session_id)
@@ -173,6 +185,7 @@ async def post_message_stream(
     body: MessageRequest,
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
+    principal: Principal = Depends(enforce_rate_limit),
 ) -> StreamingResponse:
     """SSE 流式：每个 Loop Event 作为一个 SSE 事件推给客户端。"""
     await _ensure_session(db, session_id)
