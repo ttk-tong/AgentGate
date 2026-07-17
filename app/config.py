@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     default_model: str = "claude-opus-4-8"
     default_system_prompt: str = "你是 AgentGate，一个有帮助的 AI 助手。"
+    # 全量摘要压缩用的低成本模型（plan/05 §7.3）；留空则复用主模型。
+    summary_model: str = ""
 
 
 @lru_cache

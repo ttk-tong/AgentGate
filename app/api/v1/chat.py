@@ -83,6 +83,7 @@ def _build_loop(db: AsyncSession) -> AgentLoop:
         model=settings.default_model,
         system_prompt=settings.default_system_prompt,
         registry=build_default_registry(),
+        summary_model=settings.summary_model or None,
     )
 
 

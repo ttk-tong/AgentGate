@@ -18,17 +18,25 @@ import time
 from collections.abc import AsyncIterator
 from uuid import uuid4
 
+from app.context import compactor as compaction
+from app.context.context_builder import (
+    compact_threshold,
+    estimate_request_tokens,
+)
 from app.context.session_store import SessionStore
 from app.domain.enums import EventKind, Role, SessionState
+from app.domain.errors import PromptTooLong
 from app.domain.events import Event
 from app.domain.llm import LLMRequest, ToolCall, Usage
 from app.domain.models import ContentBlock
 from app.domain.tool import ContextMutation, ToolContext, ToolResult
 from app.observability.logging import get_logger
 from app.orchestration.state import (
+    STOP_COMPACT_FAILED,
     STOP_COMPLETED,
     STOP_MAX_TOOL_CALLS,
     STOP_MAX_TURNS,
+    STOP_PROMPT_TOO_LONG,
     STOP_TIMEOUT,
     LoopConfig,
     LoopPhase,
@@ -64,6 +72,8 @@ class AgentLoop:
         config: LoopConfig | None = None,
         registry: ToolRegistry | None = None,
         enabled_tools: list[str] | None = None,
+        summarizer: Provider | None = None,
+        summary_model: str | None = None,
     ):
         self.store = store
         self.provider = provider
@@ -73,6 +83,9 @@ class AgentLoop:
         self.registry = registry
         # 暴露给模型的工具子集；None 表示注册表全集
         self.enabled_tools = enabled_tools
+        # 全量摘要压缩用的（低成本）模型；默认复用主 provider 与主模型
+        self.summarizer = summarizer or provider
+        self.summary_model = summary_model or model
 
     def _tools_schema(self) -> list[dict]:
         if self.registry is None:
@@ -169,8 +182,14 @@ class AgentLoop:
                 return
             st.turn += 1
 
-            # —— PRE_CALL：投影上下文（阶段 2 仍不做预算/压缩）——
+            # —— PRE_CALL：预算检查 →（必要时）压缩，再投影上下文（plan/05 §7、03 §4）——
             st.phase = LoopPhase.pre_call
+            async for ev, aborted in self._pre_call_compact(session_id, st, tools_schema, seq):
+                seq = ev.seq
+                yield ev
+                if aborted:
+                    return
+
             messages = await self.store.load_projection(session_id)
             request = LLMRequest(
                 model=self.model,
@@ -181,22 +200,41 @@ class AgentLoop:
             )
 
             # —— LLM_CALL：流式累积文本 + 工具调用 ——
+            # 413 prompt_too_long → 反应式压缩兜底，一次性 guard 防死循环（03 §4）
             st.phase = LoopPhase.llm_call
             text_acc = ""
             tool_calls: list[ToolCall] = []
             call_usage = Usage()
             finish_reason = "stop"
-            async for chunk in self.provider.stream(request):
-                if chunk.type == "text" and chunk.text:
-                    text_acc += chunk.text
-                    seq += 1
-                    yield Event.token(chunk.text, seq)
-                elif chunk.type == "tool_call" and chunk.tool_call:
-                    tool_calls.append(chunk.tool_call)
-                elif chunk.type == "usage" and chunk.usage:
-                    call_usage = chunk.usage
-                elif chunk.type == "finish":
-                    finish_reason = chunk.finish_reason or "stop"
+            try:
+                async for chunk in self.provider.stream(request):
+                    if chunk.type == "text" and chunk.text:
+                        text_acc += chunk.text
+                        seq += 1
+                        yield Event.token(chunk.text, seq)
+                    elif chunk.type == "tool_call" and chunk.tool_call:
+                        tool_calls.append(chunk.tool_call)
+                    elif chunk.type == "usage" and chunk.usage:
+                        call_usage = chunk.usage
+                    elif chunk.type == "finish":
+                        finish_reason = chunk.finish_reason or "stop"
+            except PromptTooLong:
+                # 已经用过反应式压缩仍超限 → 放弃（不重复烧钱）
+                if st.attempted_reactive_compact:
+                    yield _abort(st, STOP_PROMPT_TOO_LONG, seq)
+                    return
+                st.attempted_reactive_compact = True  # 一次性 guard
+                try:
+                    freed = await self._reactive_compact(session_id)
+                except compaction.CompactionError:
+                    # 兜底压缩本身失败 → 无路可走，命名中止
+                    yield _abort(st, STOP_COMPACT_FAILED, seq)
+                    return
+                seq += 1
+                yield Event(type="compact", data={"layer": "reactive", "freed_tokens": freed}, seq=seq)
+                # text_acc 尚未落库（本轮 LLM 调用未完成），直接重跑本轮
+                st.turn -= 1  # 本轮不计数：413 未产出任何 assistant 响应
+                continue
 
             st.usage = st.usage + call_usage
             seq += 1
@@ -277,6 +315,82 @@ class AgentLoop:
                 yield Event.tool_result(tc.id, tc.name, r.ok, r.display or r.content, seq)
 
             # 回到顶部继续下一轮（needs_follow_up 隐含为真）
+
+    async def _pre_call_compact(self, session_id, st, tools_schema, seq):
+        """PRE_CALL 预算检查 → 必要时压缩（plan/05 §7、03 §4）。
+
+        产出 (Event, aborted) 元组流：
+        - 压缩发生 → 产出 compact 事件，aborted=False。
+        - 压缩失败累计到熔断阈值 → 产出 done(compact_failed)，aborted=True。
+        一次只激活一层由 session.active_compaction 互斥；本轮压缩后即清除标记。
+        投影 token 未过阈值则什么都不产出。
+        """
+        messages = await self.store.load_projection(session_id)
+        projected = estimate_request_tokens(messages, self.system_prompt, tools_schema)
+        threshold = compact_threshold(self.model)
+        if projected < threshold:
+            return  # 预算充足，无需压缩
+
+        sess = await self.store.get_session(session_id)
+        if sess is not None and sess.active_compaction:
+            return  # 已有压缩在进行，一次只激活一层（防叠加）
+
+        # 选层：先试最轻的 microcompact，不够才上全量摘要（plan/05 §7 触发与互斥）
+        events = await self.store.list_events(session_id)
+        head_id = sess.head_event_id if sess else None
+        layer = (
+            "microcompact"
+            if compaction.microcompact_can_free_enough(events, head_id)
+            else "auto_compact"
+        )
+
+        await self.store.set_active_compaction(session_id, layer)
+        try:
+            if layer == "microcompact":
+                freed = await compaction.microcompact(self.store, session_id)
+            else:
+                freed = await compaction.auto_compact(
+                    self.store, session_id, self.summarizer, self.summary_model
+                )
+        except compaction.CompactionError as e:
+            st.consecutive_compact_failures += 1
+            log.warning(
+                "compact_failed",
+                session_id=str(session_id),
+                layer=layer,
+                failures=st.consecutive_compact_failures,
+                error=str(e),
+            )
+            if st.consecutive_compact_failures >= self.cfg.max_compact_failures:
+                # 熔断：上下文已不可恢复，别再每轮都试压缩（03 §4）
+                yield _abort(st, STOP_COMPACT_FAILED, seq), True
+                return
+            # 未到熔断阈值：清标记，本轮照常尝试调用（可能仍超限，交 413 兜底）
+            return
+        finally:
+            await self.store.set_active_compaction(session_id, None)
+
+        st.consecutive_compact_failures = 0  # 压缩成功，重置熔断计数
+        seq += 1
+        yield Event(
+            type="compact",
+            data={"layer": layer, "freed_tokens": freed},
+            seq=seq,
+        ), False
+
+    async def _reactive_compact(self, session_id) -> int:
+        """413 兜底：紧急全量摘要压缩一次（plan/05 §7.4、03 §4）。
+
+        无视 active_compaction 互斥（这是安全网），直接做全量摘要。返回回收 token。
+        失败则冒泡 CompactionError；调用方已用 attempted_reactive_compact 一次性 guard。
+        """
+        await self.store.set_active_compaction(session_id, "reactive")
+        try:
+            return await compaction.auto_compact(
+                self.store, session_id, self.summarizer, self.summary_model
+            )
+        finally:
+            await self.store.set_active_compaction(session_id, None)
 
     def _make_applier(self, session_id):
         """构造副作用应用器：把 ContextMutation 按 kind 落到会话上下文。

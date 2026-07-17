@@ -87,6 +87,22 @@ tests/                     # 冒烟测试
 
 测试：`tests/test_tool_executor.py`（分批 + 延迟按序应用单测，无 DB）、`tests/test_tool_e2e.py`（Mock 脚本化工具调用的端到端，含确认流程）。Mock 脚本语法：user 文本里写 `[[tool:name arg=v | name2 arg=v]]` 触发一轮工具调用。
 
-## 下一步（阶段 3）
+另外内置了一个 `weather` 只读工具（桩数据），用户问天气时模型可调它；非流式响应体新增 `tool_calls` 字段，把本轮「调了哪个工具、入参、结果」带出来便于观测。
 
-上下文预算与压缩（`compact_boundary` 生成）、max-output 恢复、模型降级链。
+## 阶段 3：上下文管理（分层压缩，已完成）
+
+长对话不超限、压缩不击穿缓存、压缩失败会熔断而非死循环：
+
+- **Token 计量 + 预算**（`context/tokenizer.py`、`context/context_builder.py`）：轻量启发式估算（中英分别校准，宁大勿小，不引入重依赖）；`effective_context_window = 模型窗口 - 输出预留`，`compact_threshold = 有效窗口 - BUFFER`；`estimate_request_tokens` 供 PRE_CALL 预算检查。常量均为经验默认，待遥测校准。
+- **microcompact**（`context/compactor.py`，日常主力）：按 `tool_call_id` 定位白名单只读工具（`kb_search` / `file_read` 等）的旧结果，除最近 `KEEP_RECENT` 个外把 content 占位化、token 归零。语义可逆（工具可重调）、不改父指针、不重排消息 → 保住 prompt cache。绝不触碰用户消息与错误结果。
+- **全量摘要压缩 + `compact_boundary`**（`compactor.auto_compact`）：对「旧历史」产出九段式结构化摘要，插入 `compact_boundary` 事件——`parent_id=None` 切断前史（投影回溯到此即停），`logical_parent_id` 保留真实指向供回放/审计，边界后保留近因尾部（`KEEP_TAIL_EVENTS`）。历史物理保留、仅从 API 视图隐藏。
+- **Loop 接入 + 失败熔断**（`agent_loop.py`）：`PRE_CALL` 投影超阈值即压缩——先试最轻的 microcompact，不够才上全量摘要；`session.active_compaction` 互斥保证「一次只激活一层」；摘要失败累计 `consecutive_compact_failures`，达 `max_compact_failures` 即熔断（`compact_failed`），不死循环。
+- **反应式压缩**（413 兜底）：Provider 吃到 `413 / context length exceeded` 抛 `PromptTooLong`，Loop 紧急全量摘要一次后重跑本轮；`attempted_reactive_compact` 一次性 guard 保证「压缩后仍超限 → 放弃」而非反复烧钱。
+
+完成标志：长对话经压缩后不超限；microcompact 就地占位不重排消息、不破坏缓存前缀；压缩失败在阈值内熔断退出。
+
+测试：`tests/test_context_budget.py`（tokenizer / 预算 / microcompact 规划单测，无 DB）、`tests/test_compaction.py`（microcompact 就地回收、`auto_compact` 设边界截断历史、边界后投影正确、熔断计数，DB 端到端）。
+
+## 下一步（阶段 4）
+
+max-output 恢复、模型降级链、记忆固化（见 plan/06）。

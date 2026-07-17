@@ -20,18 +20,18 @@ from app.domain.llm import LLMMessage, ToolCall, ToolResultMessage
 from app.domain.models import ContentBlock, SessionEvent
 
 
-def project_context(events: list[SessionEvent], head_id: UUID | None) -> list[LLMMessage]:
-    """把事件 DAG 投影成要发给 LLM 的消息序列。
+def build_main_chain(events: list[SessionEvent], head_id: UUID | None) -> list[SessionEvent]:
+    """从 head 沿 parent_id 回溯出主链，时间正序返回（步骤 1+2）。
 
-    events：该会话的全部事件（顺序不限，内部按 id 建索引）。
-    head_id：DAG 头（session.head_event_id）。为 None 时返回空。
+    遇到 compact_boundary 即停（边界前 parent 已断），子 agent 事件不纳入。
+    带环检测。被 project_context 与 compactor 共用，保证「进入上下文的那批事件」
+    定义一致。
     """
     if head_id is None:
         return []
 
     by_id: dict[UUID, SessionEvent] = {e.id: e for e in events}
 
-    # —— 1+2. 从 head 沿 parent_id 回溯，遇到 compact_boundary 即停（边界前 parent 已断）——
     chain: list[SessionEvent] = []
     seen: set[UUID] = set()
     cursor: UUID | None = head_id
@@ -54,6 +54,19 @@ def project_context(events: list[SessionEvent], head_id: UUID | None) -> list[LL
         cursor = node.parent_id
 
     chain.reverse()  # 回溯得到的是"从新到旧"，反转为时间正序
+    return chain
+
+
+def project_context(events: list[SessionEvent], head_id: UUID | None) -> list[LLMMessage]:
+    """把事件 DAG 投影成要发给 LLM 的消息序列。
+
+    events：该会话的全部事件（顺序不限，内部按 id 建索引）。
+    head_id：DAG 头（session.head_event_id）。为 None 时返回空。
+    """
+    if head_id is None:
+        return []
+
+    chain = build_main_chain(events, head_id)
 
     # —— 3. 按 message_id 归并并行兄弟节点 ——
     return _merge_and_render(chain)

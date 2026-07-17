@@ -117,6 +117,103 @@ class SessionStore:
         sess.meta = meta
         await self.db.flush()
 
+    async def replace_event_content(
+        self, event_id: uuid.UUID, content: list[ContentBlock]
+    ) -> None:
+        """就地改写一个事件的 content（microcompact 回收工具结果用，plan/05 §7.1）。
+
+        这是 append-only 的受控例外：只回收工具结果内容为占位，不改父指针、
+        不改结构、语义可逆（工具可重调），因此不破坏 DAG 也不重排消息。
+        """
+        row = await self.db.get(SessionEventRow, event_id)
+        if row is None:
+            raise ValueError(f"event not found: {event_id}")
+        row.content = _dump_content(content)
+        await self.db.flush()
+
+    async def insert_compact_boundary(
+        self,
+        session_id: uuid.UUID,
+        *,
+        summary: str,
+        summarized_head: uuid.UUID,
+        reparent_event_id: uuid.UUID | None,
+    ) -> uuid.UUID:
+        """插入一个 compact_boundary 事件切断前史（plan/05 §7.3）。
+
+        - boundary.parent_id=None 切断前史（投影回溯到此即停）；
+          logical_parent_id=summarized_head 保留真实指向供回放/审计。
+        - reparent_event_id：保留在边界之后的「主链第一条」，把它的 parent_id
+          指向该边界（logical_parent_id 不动，仍指真实前史）。为 None 表示
+          不保留任何尾部，边界即新 head，后续消息接在摘要之后。
+        - 边界之前的事件物理保留、不再进入投影。
+
+        注意 boundary 的 seq 要落在被摘要历史与保留尾部之间，保证投影链顺序正确。
+        """
+        sess = await self.db.get(SessionRow, session_id)
+        if sess is None:
+            raise ValueError(f"session not found: {session_id}")
+
+        tail_row = None
+        if reparent_event_id is not None:
+            tail_row = await self.db.get(SessionEventRow, reparent_event_id)
+            if tail_row is None:
+                raise ValueError(f"event not found: {reparent_event_id}")
+
+        # boundary 的 seq：紧挨在保留尾部第一条之前（若无尾部则取当前最大 seq+1）
+        if tail_row is not None:
+            boundary_seq = tail_row.seq - 1
+        else:
+            max_seq = await self.db.scalar(
+                select(SessionEventRow.seq)
+                .where(SessionEventRow.session_id == session_id)
+                .order_by(SessionEventRow.seq.desc())
+                .limit(1)
+            )
+            boundary_seq = (max_seq or 0) + 1
+
+        row = SessionEventRow(
+            session_id=session_id,
+            parent_id=None,  # 切断前史：投影回溯到此即停
+            logical_parent_id=summarized_head,  # 保留真实前史供审计
+            kind=EventKind.compact_boundary.value,
+            role=None,
+            content=_dump_content([ContentBlock(type="text", text=summary)]),
+            seq=boundary_seq,
+        )
+        self.db.add(row)
+        await self.db.flush()
+
+        if tail_row is not None:
+            # 保留尾部：把边界后第一条的 parent 指向边界，head 不变
+            tail_row.parent_id = row.id
+        else:
+            # 不保留尾部：边界即新 head
+            sess.head_event_id = row.id
+        sess.last_boundary_id = row.id
+        await self.db.flush()
+        return row.id
+
+    async def set_active_compaction(
+        self, session_id: uuid.UUID, layer: str | None
+    ) -> None:
+        """设置/清除当前激活的压缩层（plan/05 §7 一次只激活一层的互斥标记）。"""
+        sess = await self.db.get(SessionRow, session_id)
+        if sess is None:
+            raise ValueError(f"session not found: {session_id}")
+        sess.active_compaction = layer
+        await self.db.flush()
+
+    async def set_effective_context_window(
+        self, session_id: uuid.UUID, window: int
+    ) -> None:
+        """把有效上下文窗口快照写回会话（plan/05 §6）。"""
+        sess = await self.db.get(SessionRow, session_id)
+        if sess is None:
+            raise ValueError(f"session not found: {session_id}")
+        sess.effective_context_window = window
+        await self.db.flush()
+
     async def load_projection(self, session_id: uuid.UUID) -> list[LLMMessage]:
         """读全部事件并投影为 LLM 消息序列（见 projection.project_context）。
 

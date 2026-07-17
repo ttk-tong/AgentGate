@@ -16,6 +16,7 @@ from collections.abc import AsyncIterator
 import httpx
 
 from app.domain.enums import Role
+from app.domain.errors import PromptTooLong, ProviderOverloaded
 from app.domain.llm import LLMMessage, LLMRequest, StreamChunk, ToolCall, Usage
 
 
@@ -42,6 +43,18 @@ class OpenAICompatProvider:
 
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             async with client.stream("POST", url, headers=headers, json=payload) as resp:
+                # 413 / 上下文超限 → 抛 PromptTooLong，交 Loop 反应式压缩兜底（03 §4）
+                if resp.status_code == 413:
+                    await resp.aread()
+                    raise PromptTooLong(f"prompt too long: {resp.status_code}")
+                if resp.status_code == 400:
+                    body = (await resp.aread()).decode("utf-8", "replace").lower()
+                    if "context" in body and ("length" in body or "long" in body or "exceed" in body):
+                        raise PromptTooLong(f"context length exceeded: {body[:200]}")
+                    resp.raise_for_status()
+                if resp.status_code in (429, 503):
+                    await resp.aread()
+                    raise ProviderOverloaded(f"provider overloaded: {resp.status_code}")
                 resp.raise_for_status()
                 async for line in resp.aiter_lines():
                     if not line or not line.startswith("data:"):
