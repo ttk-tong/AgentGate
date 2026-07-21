@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     app_env: str = "dev"
     log_level: str = "INFO"
     log_json: bool = False  # 生产建议 true（结构化 JSON 日志）
+    # dev 便利：启动时自动 alembic upgrade head 建/升表。仅 app_env=dev 生效，
+    # 生产必须留 false、走手动迁移（可控可审计）。
+    auto_migrate: bool = True
 
     # —— 存储 ——
     database_url: str = Field(
@@ -42,6 +45,15 @@ class Settings(BaseSettings):
     auth_salt: str = "dev-insecure-salt-change-me"
     # 是否强制认证。dev 默认关闭，方便本地无 key 调试；生产应设 true。
     auth_required: bool = False
+
+    # —— 记忆 / 技能 / 提示词分层（plan/06、07、08）——
+    # 是否启用长期记忆召回与写入（remember 工具 + 召回注入 prompt）。
+    memory_enabled: bool = True
+    # 技能目录（扫描 SKILL.md）；留空则不加载任何技能。
+    skills_dir: str = ""
+    # Agent 身份（提示词 identity 块）。
+    agent_name: str = "AgentGate"
+    agent_role: str = "一个有帮助的 AI 助手"
 
     def fallback_model_list(self) -> list[str]:
         return [m.strip() for m in self.fallback_models.split(",") if m.strip()]

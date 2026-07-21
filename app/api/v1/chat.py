@@ -21,16 +21,25 @@ from starlette.responses import StreamingResponse
 
 from app.api.middleware.auth import enforce_rate_limit
 from app.config import get_settings
+from app.context.memory.recall import MemoryService
+from app.context.memory.store import DbMemoryStore
 from app.context.session_store import SessionStore
 from app.domain.events import Event
 from app.domain.llm import ToolCall
 from app.domain.principal import Principal
 from app.orchestration.agent_loop import AgentLoop, ConfirmationPending
+from app.orchestration.prompt.assembler import PromptAssembler
+from app.orchestration.prompt.composer import PromptComposer
 from app.orchestration.session_lock import SessionBusyError, session_lock
+from app.orchestration.skills.registry import SkillRegistry
 from app.orchestration.tools import build_default_registry
 from app.persistence.db import get_db
 from app.persistence.redis_client import get_redis
 from app.routing.factory import get_provider
+
+# 技能注册表：进程内单例，首次用时按 settings.skills_dir 扫描 SKILL.md（plan/07 §4）。
+_SKILL_REGISTRY: SkillRegistry | None = None
+
 
 # 主模型过载时的降级模型链（plan/03 §5）。逗号分隔配置解析而来。
 def _fallback_models() -> list[str]:
@@ -82,19 +91,65 @@ async def create_session(
     return CreateSessionResponse(session_id=sid)
 
 
-def _build_loop(db: AsyncSession) -> AgentLoop:
+def _get_skill_registry() -> SkillRegistry | None:
+    """进程内技能注册表单例（阶段 6）。skills_dir 留空则不加载任何技能。
+
+    加载时用工具注册表的名字集校验技能引用的工具都存在（缺失只告警跳过）。
+    """
+    global _SKILL_REGISTRY
+    if _SKILL_REGISTRY is not None:
+        return _SKILL_REGISTRY
+    settings = get_settings()
+    if not settings.skills_dir:
+        return None
+    reg = SkillRegistry()
+    known = set(build_default_registry().names())
+    reg.load_dir(settings.skills_dir, known_tools=known)
+    _SKILL_REGISTRY = reg
+    return reg
+
+
+async def _build_loop(db: AsyncSession, session_id: uuid.UUID | None = None) -> AgentLoop:
+    """装配 Agent Loop。阶段 6：按配置挂上记忆服务 + 提示词分层组装器。
+
+    session_id 给定时读取会话的 external_user / tenant_id，供记忆召回的 scope
+    隔离与 remember 写入定位（匿名会话则不召回/不写用户级记忆）。
+    """
     settings = get_settings()
     store = SessionStore(db)
     # 降级链：逗号分隔的模型名，过载时按序切换（plan/03 §5、02 §3.2）
     fallbacks = [m.strip() for m in settings.fallback_models.split(",") if m.strip()]
+    registry = build_default_registry()
+
+    # —— 阶段 6：记忆 + 技能 + 提示词分层（按配置启用，缺则优雅降级）——
+    external_user: str | None = None
+    tenant_id: str | None = None
+    if session_id is not None:
+        sess = await store.get_session(session_id)
+        if sess is not None:
+            external_user = sess.external_user
+            tenant_id = str(sess.tenant_id) if sess.tenant_id else None
+
+    memory = MemoryService(DbMemoryStore(db)) if settings.memory_enabled else None
+    composer = PromptComposer(
+        PromptAssembler(agent_name=settings.agent_name, agent_role=settings.agent_role),
+        memory=memory,
+        skills=_get_skill_registry(),
+        base_tools=registry.names(),
+    )
+
     return AgentLoop(
         store=store,
         provider=get_provider(),
         model=settings.default_model,
         system_prompt=settings.default_system_prompt,
-        registry=build_default_registry(),
+        registry=registry,
         summary_model=settings.summary_model or None,
         fallback_models=fallbacks or None,
+        memory=memory,
+        prompt_composer=composer,
+        external_user=external_user,
+        tenant_id=tenant_id,
     )
 
 
@@ -126,7 +181,7 @@ async def post_message(
 ) -> MessageResponse:
     """非流式：内部消费 Loop 事件流，聚合成一次性响应。"""
     await _ensure_session(db, session_id)
-    loop = _build_loop(db)
+    loop = await _build_loop(db, session_id)
 
     try:
         async with session_lock(redis, session_id):
@@ -189,7 +244,7 @@ async def post_message_stream(
 ) -> StreamingResponse:
     """SSE 流式：每个 Loop Event 作为一个 SSE 事件推给客户端。"""
     await _ensure_session(db, session_id)
-    loop = _build_loop(db)
+    loop = await _build_loop(db, session_id)
 
     async def event_gen() -> AsyncIterator[str]:
         try:
@@ -230,7 +285,7 @@ async def post_confirmation(
 
     approved = {body.tool_call_id} if body.approved else set()
     rejected = set() if body.approved else {body.tool_call_id}
-    loop = _build_loop(db)
+    loop = await _build_loop(db, session_id)
 
     try:
         async with session_lock(redis, session_id):

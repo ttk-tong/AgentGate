@@ -14,6 +14,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -153,6 +154,47 @@ class ScheduleRow(Base):
     )
 
     __table_args__ = (Index("ix_schedule_due", "enabled", "next_fire_at"),)
+
+
+class MemoryItemRow(Base):
+    """长期记忆（plan/10 §1.5，基线版）。
+
+    基线刻意不建向量列（embedding）：召回走索引头部扫描 + 小模型选择，不做向量检索
+    （按修订版对过度设计的修正）。日后要上 pgvector 再加列 + 迁移即可，本表结构向前兼容。
+    scope + scope_key 组合索引支撑三级隔离下的快速召回。
+    """
+
+    __tablename__ = "memory_item"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenant.id"), nullable=True
+    )
+    scope: Mapped[str] = mapped_column(String(16), nullable=False)  # user/agent/session
+    scope_key: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)  # fact/preference/event/summary
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    importance: Mapped[float] = mapped_column(Float, nullable=False, default=0.5)
+    source_event_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    use_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_used_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_memory_scope", "scope", "scope_key"),
+        Index("ix_memory_tenant", "tenant_id"),
+        # 去重：同一 scope/scope_key/kind 下内容哈希唯一（应用层用 dedup_key 兜底）
+        Index("ix_memory_dedup", "scope", "scope_key", "kind"),
+    )
 
 
 class SessionRow(Base):

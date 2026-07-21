@@ -76,6 +76,10 @@ class AgentLoop:
         summarizer: Provider | None = None,
         summary_model: str | None = None,
         fallback_models: list[str] | None = None,
+        memory=None,
+        prompt_composer=None,
+        external_user: str | None = None,
+        tenant_id: str | None = None,
     ):
         self.store = store
         self.provider = provider
@@ -90,6 +94,14 @@ class AgentLoop:
         self.summary_model = summary_model or model
         # 过载时的模型降级链（同一 provider 换模型重跑，plan/03 §5）
         self.fallback_models = fallback_models or []
+        # —— 阶段 6：记忆 + 技能 + 提示词分层（都可选，None 则退回静态 system_prompt）——
+        # memory：MemoryService，供 remember 工具落库与召回；
+        # prompt_composer：PromptComposer，run() 时按用户输入召回记忆 + 激活技能，
+        #   动态组装 system prompt（并把技能工具并入本轮工具集）。
+        self.memory = memory
+        self.prompt_composer = prompt_composer
+        self.external_user = external_user
+        self.tenant_id = tenant_id
 
     def _tools_schema(self) -> list[dict]:
         if self.registry is None:
@@ -108,6 +120,11 @@ class AgentLoop:
 
     async def run(self, session_id, user_text: str) -> AsyncIterator[Event]:
         """驱动一次用户输入的完整运行，产出对外 Event 流。"""
+        # —— 阶段 6：按本轮用户输入动态组装 prompt（召回记忆 + 激活技能）——
+        # 有 composer 才走；组装出的 system 与工具子集只作用于本次 run（loop 每请求新建）。
+        if self.prompt_composer is not None:
+            await self._compose_prompt(session_id, user_text)
+
         # 用户输入先落库为 message 事件
         await self.store.append_event(
             session_id,
@@ -117,6 +134,37 @@ class AgentLoop:
         )
         async for ev in self._drive(session_id):
             yield ev
+
+    async def _compose_prompt(self, session_id, user_text: str) -> None:
+        """调用 PromptComposer 组装 system prompt，并把激活技能的工具并入本轮工具集。
+
+        失败不致命：组装异常时保留原静态 system_prompt，记录告警后继续（稳健优先）。
+        """
+        from app.orchestration.prompt.composer import ComposeContext
+
+        try:
+            import datetime as _dt
+
+            now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+            ctx = ComposeContext(
+                now_iso=now_iso,
+                tenant_id=self.tenant_id,
+                external_user=self.external_user,
+                session_id=str(session_id),
+            )
+            composed = await self.prompt_composer.compose(user_text, ctx)
+            self.system_prompt = composed.system
+            if composed.enabled_tools is not None:
+                self.enabled_tools = composed.enabled_tools
+            log.info(
+                "prompt_composed",
+                session_id=str(session_id),
+                cache_prefix_hash=composed.debug.get("cache_prefix_hash"),
+                activated_skills=composed.activated_skills,
+                recalled=composed.recalled_count,
+            )
+        except Exception as e:  # 组装失败退回静态 prompt，不阻断对话
+            log.warning("prompt_compose_failed", session_id=str(session_id), error=str(e))
 
     async def resume(
         self,
@@ -462,10 +510,38 @@ class AgentLoop:
         async def apply(mutation: ContextMutation) -> None:
             if mutation.kind == "append_note":
                 await self.store.append_note(session_id, mutation.payload.get("text", ""))
+            elif mutation.kind == "remember":
+                await self._apply_remember(session_id, mutation.payload)
             else:
                 log.warning("unknown_mutation", kind=mutation.kind)
 
         return apply
+
+    async def _apply_remember(self, session_id, payload: dict) -> None:
+        """remember 工具的副作用：写入长期记忆（plan/06 §4.1）。
+
+        scope 固定 user（跨会话记住），scope_key 取会话的 external_user；无记忆服务
+        或无 external_user（匿名会话）则跳过——工具本身不接触用户标识，防越权。
+        """
+        if self.memory is None:
+            log.warning("remember_no_memory_service", session_id=str(session_id))
+            return
+        sess = await self.store.get_session(session_id)
+        external_user = sess.external_user if sess else None
+        if not external_user:
+            log.info("remember_skipped_anonymous", session_id=str(session_id))
+            return
+        from app.domain.memory import MemoryDraft, MemoryKind, MemoryScope
+
+        draft = MemoryDraft(
+            scope=MemoryScope.user,
+            scope_key=external_user,
+            kind=MemoryKind(payload.get("kind", "preference")),
+            content=payload.get("content", ""),
+            importance=0.6,
+            tenant_id=str(sess.tenant_id) if sess and sess.tenant_id else None,
+        )
+        await self.memory.form([draft])
 
 
 def _result_block(call: ToolCall, result: ToolResult) -> ContentBlock:

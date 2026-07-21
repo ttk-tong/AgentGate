@@ -21,6 +21,20 @@ async def lifespan(app: FastAPI):
     configure_logging(level=settings.log_level, json_output=settings.log_json)
     log = get_logger("app")
     log.info("startup", app_env=settings.app_env, version=__version__)
+    # dev 便利：自动把 schema 升到最新（alembic upgrade head）。仅 dev 生效，
+    # 生产走手动迁移。跑迁移而非 create_all——保持 alembic_version 一致，
+    # 后续手动 upgrade 不会与自动建表冲突。失败只告警不阻断启动（便于排查）。
+    if settings.app_env == "dev" and settings.auto_migrate:
+        import asyncio
+
+        from app.persistence.migrate import upgrade_to_head
+
+        try:
+            # 放工作线程：Alembic 在线迁移内部会 asyncio.run，不能在本事件循环里直接跑
+            await asyncio.to_thread(upgrade_to_head)
+            log.info("auto_migrate.done")
+        except Exception as e:  # noqa: BLE001
+            log.warning("auto_migrate.failed", error=str(e))
     yield
     await dispose_engine()
     await close_redis()

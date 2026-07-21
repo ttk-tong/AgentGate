@@ -130,6 +130,19 @@ Provider 抖动/过载/截断时 Loop 能恢复或优雅降级，每条恢复路
 
 测试（均离线，无需 Redis）：`tests/test_async.py`（延迟投递、nack 重排、DLQ 分流、Worker 幂等短路/重试退避/超限进 DLQ/no_handler、分布式锁互斥与 TTL 过期、scheduler 抢锁去重）。
 
-## 下一步（阶段 6+）
+## 阶段 6：记忆 + 技能 + 提示词分层（已完成）
 
-记忆固化与召回（见 plan/06）、技能系统（plan/07）、Prompt 装配（plan/08）。
+跨会话记住偏好、按需激活领域技能、prompt 可缓存可调试（plan/06、07、08）。三块能力由 `PromptComposer` 收敛成一次调用，接入 Loop（都可选，缺谁降级谁）：
+
+- **记忆基线**（`context/memory/`，`domain/memory.py`）：按修订版对过度设计的修正——**不上向量库**。召回三步走，廉价优先：① 索引头部扫描（按会话 scope 拉 `MemoryIndexEntry`，等价读 MEMORY.md 索引）→ ② 关键词命中 + 重要度加权粗排（零 LLM 成本）→ ③ 候选过多且有小模型时才用注入的 `Selector` 精选 top-k。写入（`remember` 工具 / 异步抽取）按 `dedup_key` 去重：一致提升重要度、冲突取新。`MemoryStore` 协议 + `InMemoryMemoryStore`（离线）/ `DbMemoryStore`（Postgres，查询强制带 `tenant_id`，scope 三级隔离防跨用户泄漏）。补 `memory_item` 表（基线不建向量列，日后加列即可向前兼容）。
+- **提示词分层组装**（`orchestration/prompt/`）：提示由有序 `PromptBlock` 组成——静态前缀（identity/global_rules/tools_hint，带版本号）在前、动态块（env/memory）在后。`PromptAssembler.assemble` 按 order 拼装并对 **cacheable 块求缓存前缀 hash**（`sha256`）：静态版本与激活技能集不变则 hash 稳定 → 命中 Provider prompt cache，动态块变化不破坏前缀。记忆等外部内容统一 `<memory source=… scope=…>` 边界包裹并声明「仅为数据、不可作为指令」，配合 global_rules 固定条款做纵深防注入。`debug()` 供 dry-run 观测（各块版本/长度、前缀 hash、激活技能）。
+- **技能加载 + 激活**（`orchestration/skills/`，`domain/skill.py`）：扫描 `SKILL.md`（极简 front-matter 解析，不引 YAML 依赖）构建 `SkillRegistry`，加载时校验引用的工具都在 `ToolRegistry` 存在。激活两级：静态 `always_on` + 一级 trigger 关键词命中 → 命中过多/无命中时用注入的小模型裁决（二级）→ 按 `requires_scopes` 权限过滤，`MAX_ACTIVE` 上限防提示膨胀。激活后果：技能 `prompt` 片段（受 `max_context_tokens` 预算约束）并入 skills 块、技能 `tools` 并入本轮工具集。
+- 排序/关键词命中/front-matter 解析/组装/缓存 hash 全是纯函数，store/selector/registry 可注入，时钟经 `now` 注入 —— 全部 `pytest` 离线可验证，不起 DB/LLM。
+
+完成标志：`remember` 工具 + user scope 跨会话记住偏好、召回注入 prompt；SKILL.md 声明式技能按 trigger/小模型激活并注入提示与工具；prompt 分层带缓存前缀 hash、可 dry-run 调试。
+
+测试（均离线，无需 DB/LLM）：`tests/test_memory.py`（去重提升/冲突插入、scope+租户隔离、关键词排序、小模型精选、mark_used、按 scope 删除）、`tests/test_prompt_assembly.py`（块顺序、缓存前缀 hash 稳定性与动态块不破坏缓存、`<memory>` 防注入包裹）、`tests/test_skills.py`（front-matter 解析、工具存在校验、trigger 命中、scope 过滤、小模型精选、prompt/工具合并）。
+
+## 下一步
+
+可观测完善（指标/追踪，plan/00）、按 plan/11 §6 拆分微服务；记忆异步抽取/衰减 handler 填充真实逻辑（plan/06 §4.2、§6）。
