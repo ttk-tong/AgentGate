@@ -117,6 +117,19 @@ Provider 抖动/过载/截断时 Loop 能恢复或优雅降级，每条恢复路
 
 测试（均离线，无需 DB/Redis）：`tests/test_auth.py`（密钥哈希/解析、过期吊销、scope、租户隔离）、`tests/test_resilience.py`（退避、熔断状态流转、降级链、限流补桶/并发）、`tests/test_model_router.py`（能力过滤、降级链、熔断剔除）；`tests/test_loop_recovery.py`（过载降级、max-output 恢复、错误抑制，DB 端到端）。
 
-## 下一步（阶段 5+）
+## 阶段 5：异步能力（队列 + Worker + 调度，已完成）
 
-记忆固化与召回（见 plan/06）、技能系统（plan/07）、Prompt 装配（plan/08）、异步任务与调度（plan/09）。
+把不必阻塞对话主链路的工作（记忆抽取、会话固化等）放到异步通道执行（plan/09）：
+
+- **队列抽象**（`async_/queue.py`）：`TaskMessage`（带 `idempotency_key` / `not_before` 延迟 / `attempt` 重试计数）+ `Queue` 协议。`InMemoryQueue`（进程内 asyncio 队列 + 延迟缓冲，离线测试/单体默认）与 `RedisStreamsQueue`（`XADD` 入队、消费者组 `XREADGROUP` 消费、`XACK` 确认、`XAUTOCLAIM` 回收崩溃 Worker 未 ack 的消息；延迟消息走 ZSet 到点搬入主流）。`ack/nack/to_dlq` 统一收整条消息，各后端自取定位所需信息。补 `task` / `schedule` 表。
+- **Worker**（`async_/worker.py`）：消费循环按 `msg.type` 分派 `HANDLERS`。**幂等短路**（`idempotency_key` 已 done 直接 ack，`DoneStore` 可注入 Redis SETNX / 内存）→ 执行 handler → 成功 `mark_done` + ack；`RetryableError` 未超 `max_attempts` 则 `nack` 退避重排（复用 `backoff_delay`），超限进 **DLQ**；其它异常直接进 DLQ（fatal）。
+- **Scheduler**（`async_/scheduler.py` + `lock.py`）：`fire_job` 纯核心——抢 `job_id` 的**分布式锁**（`SET NX PX`，`RedisLock` 生产 / `InMemoryLock` 测试）抢到才入队，保证多实例同一 cron 只触发一次；`register_jobs` 惰性绑定 APScheduler（未装也能导入本模块单测 `fire_job`）。
+- 时钟/随机源全部注入，队列/Worker/锁/调度均可离线确定化验证，不起 Redis。
+
+完成标志：能把「记忆抽取」「会话固化」这类任务异步化——`memory.extract` / `session.finalize` handler 骨架就位（Stage 6 记忆层落地后填充真实逻辑，接口不变）。
+
+测试（均离线，无需 Redis）：`tests/test_async.py`（延迟投递、nack 重排、DLQ 分流、Worker 幂等短路/重试退避/超限进 DLQ/no_handler、分布式锁互斥与 TTL 过期、scheduler 抢锁去重）。
+
+## 下一步（阶段 6+）
+
+记忆固化与召回（见 plan/06）、技能系统（plan/07）、Prompt 装配（plan/08）。
