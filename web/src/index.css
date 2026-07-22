@@ -1,0 +1,70 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: #0e1013;
+  color: #e8e4da;
+  font-family: "Inter", system-ui, -apple-system, "Segoe UI", "PingFang SC",
+    "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 细滚动条：深底 */
+.scroll-dark {
+  scrollbar-width: thin;
+  scrollbar-color: #232630 transparent;
+}
+.scroll-dark::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.scroll-dark::-webkit-scrollbar-thumb {
+  background: #232630;
+  border-radius: 4px;
+}
+/* 纸色区滚动条 */
+.scroll-paper {
+  scrollbar-width: thin;
+  scrollbar-color: #d8d1c2 transparent;
+}
+.scroll-paper::-webkit-scrollbar {
+  width: 8px;
+}
+.scroll-paper::-webkit-scrollbar-thumb {
+  background: #d8d1c2;
+  border-radius: 4px;
+}
+
+/* compact 事件的斜纹填充 */
+.hatch {
+  background-image: repeating-linear-gradient(
+    45deg,
+    rgba(176, 140, 255, 0.18),
+    rgba(176, 140, 255, 0.18) 4px,
+    transparent 4px,
+    transparent 8px
+  );
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

@@ -21,6 +21,11 @@ class Settings(BaseSettings):
     # dev 便利：启动时自动 alembic upgrade head 建/升表。仅 app_env=dev 生效，
     # 生产必须留 false、走手动迁移（可控可审计）。
     auto_migrate: bool = True
+    # 允许跨域的前端来源（逗号分隔）。dev 默认放行 Vite 开发端口；生产按需收紧。
+    cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
+
+    def cors_origin_list(self) -> list[str]:
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 
     # —— 存储 ——
     database_url: str = Field(

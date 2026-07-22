@@ -32,13 +32,13 @@ async def lifespan(app: FastAPI):
         try:
             # 放工作线程：Alembic 在线迁移内部会 asyncio.run，不能在本事件循环里直接跑
             await asyncio.to_thread(upgrade_to_head)
-            log.info("auto_migrate.done")
+            # log.info("auto_migrate.done")
         except Exception as e:  # noqa: BLE001
             log.warning("auto_migrate.failed", error=str(e))
     yield
     await dispose_engine()
     await close_redis()
-    log.info("shutdown")
+    # log.info("shutdown")
 
 
 def _register_exception_handlers(app: FastAPI) -> None:
@@ -70,6 +70,20 @@ def _register_exception_handlers(app: FastAPI) -> None:
 
 def create_app() -> FastAPI:
     app = FastAPI(title="AgentGate", version=__version__, lifespan=lifespan)
+    # CORS：允许前端（Vite 开发端口等）跨域访问。dev 流程走 Vite 反代本是同源，
+    # 但直连 :8000 或分离部署时需要放行；来源由 cors_origins 配置控制。
+    settings = get_settings()
+    origins = settings.cors_origin_list()
+    if origins:
+        from fastapi.middleware.cors import CORSMiddleware
+
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
     app.add_middleware(TraceMiddleware)
     _register_exception_handlers(app)
     app.include_router(health_router)
