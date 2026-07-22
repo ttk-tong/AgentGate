@@ -32,7 +32,8 @@ from app.orchestration.prompt.assembler import PromptAssembler
 from app.orchestration.prompt.composer import PromptComposer
 from app.orchestration.session_lock import SessionBusyError, session_lock
 from app.orchestration.skills.registry import SkillRegistry
-from app.orchestration.tools import build_default_registry
+from app.orchestration.subagent import SubagentRunner
+from app.orchestration.tools import attach_spawn_agent, build_default_registry
 from app.persistence.db import get_db
 from app.persistence.redis_client import get_redis
 from app.routing.factory import get_provider
@@ -120,6 +121,19 @@ async def _build_loop(db: AsyncSession, session_id: uuid.UUID | None = None) -> 
     # 降级链：逗号分隔的模型名，过载时按序切换（plan/03 §5、02 §3.2）
     fallbacks = [m.strip() for m in settings.fallback_models.split(",") if m.strip()]
     registry = build_default_registry()
+    provider = get_provider()
+
+    # —— 阶段 7：注入子 agent 执行体，并挂载 spawn_agent 工具（plan/03 §8、04 §8）——
+    # session_id 为 None（如果未来出现无 session 的调用路径）就不挂 spawn_agent。
+    if session_id is not None:
+        runner = SubagentRunner(
+            provider=provider,
+            registry=registry,
+            default_model=settings.default_model,
+            store=store,
+            parent_session_id=session_id,
+        )
+        attach_spawn_agent(registry, runner)
 
     # —— 阶段 6：记忆 + 技能 + 提示词分层（按配置启用，缺则优雅降级）——
     external_user: str | None = None
@@ -140,7 +154,7 @@ async def _build_loop(db: AsyncSession, session_id: uuid.UUID | None = None) -> 
 
     return AgentLoop(
         store=store,
-        provider=get_provider(),
+        provider=provider,
         model=settings.default_model,
         system_prompt=settings.default_system_prompt,
         registry=registry,

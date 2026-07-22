@@ -143,6 +143,20 @@ Provider 抖动/过载/截断时 Loop 能恢复或优雅降级，每条恢复路
 
 测试（均离线，无需 DB/LLM）：`tests/test_memory.py`（去重提升/冲突插入、scope+租户隔离、关键词排序、小模型精选、mark_used、按 scope 删除）、`tests/test_prompt_assembly.py`（块顺序、缓存前缀 hash 稳定性与动态块不破坏缓存、`<memory>` 防注入包裹）、`tests/test_skills.py`（front-matter 解析、工具存在校验、trigger 命中、scope 过滤、小模型精选、prompt/工具合并）。
 
+## 阶段 7：子 Agent（隔离 + fan-out，已完成）
+
+模型能主动委派并行子任务，中间过程不污染父上下文（plan/03 §8、04 §8）：
+
+- **子 agent 领域**（`domain/subagent.py`）：`SubAgentSpec`（task / allowed_tools / model / max_turns）。`allowed_tools` **替换而非合并**父的工具集，独立收紧权限。
+- **隔离执行体**（`orchestration/subagent.py`）：`SubagentRunner` 跑一个**受限的完整子 Loop**——独立工具集（`registry.to_openai_schema(spec.allowed_tools)`）、独立 `agent_id`、独立事件流（只存在内存里，不落父 DAG）。只把最终文本回传给父。父 DAG 里落两条 `is_sidechain=True` 的标记事件（start / end）供审计。
+- **`spawn_agent` 工具**（`orchestration/tools/builtin/spawn_agent.py`）：`is_read_only=True + is_concurrency_safe=True` → tool_executor 会自动把**多个 `spawn_agent` 调用归入同一并发批 fan-out 并行**（呼应 plan/04 §8 的读写分批）。运行体由 `attach_spawn_agent(registry, runner)` 每请求注入（携带父 `session_id` / `provider` / `default_model`）。
+- **`is_sidechain` 语义**：`SessionStore.append_event` 对 sidechain 事件不改父 head——否则后续父消息会挂到 sidechain 之下，把子过程「拉回」父投影；`projection.build_main_chain` 早已跳过 sidechain 节点，两侧对齐。
+- 子 loop 不接压缩/记忆召回/技能激活（子任务应轻量），也不接 dangerous 确认流程——保持精简。
+
+完成标志：模型可通过 `spawn_agent` 委派并行子任务；`allowed_tools` 独立收紧；中间对话/工具调用不进入父 LLM 上下文；两次以上 `spawn_agent` 并行 fan-out。
+
+测试（`tests/test_subagent.py`，全部离线）：`is_read_only+concurrency_safe` 使 `partition_tool_calls` 归入一个并发批；子 loop `tool_call → 回填 → 最终文本` 端到端；`allowed_tools` 只有声明的工具进子 `LLMRequest.tools`；`max_turns` 用尽优雅回传；`spawn_agent` 工具 runner 缺失/参数无效路径；`execute_batched` fan-out 两次 spawn_agent 顺序回填结果。
+
 ## 下一步
 
 可观测完善（指标/追踪，plan/00）、按 plan/11 §6 拆分微服务；记忆异步抽取/衰减 handler 填充真实逻辑（plan/06 §4.2、§6）。

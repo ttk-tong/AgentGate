@@ -37,12 +37,18 @@ class SessionStore:
         message_id: uuid.UUID | None = None,
         parent_id: uuid.UUID | None = None,
         logical_parent_id: uuid.UUID | None = None,
+        is_sidechain: bool = False,
+        agent_id_ref: str | None = None,
     ) -> uuid.UUID:
         """追加一个事件。
 
         父指针：显式传入则用之；否则默认接到当前 head_event_id 之后。
         seq：取当前会话最大 seq + 1，仅用于稳定排序/调试。
-        同时更新 session.head_event_id。
+        同时更新 session.head_event_id（sidechain 事件例外——见下）。
+        is_sidechain：子 agent 事件标记（plan/03 §8），默认不参与父投影
+            （见 projection.build_main_chain）。这类事件不应改动父 head——否则
+            后续父消息会挂到 sidechain 之下，把子 agent 中间过程"拉进"父投影。
+        agent_id_ref：产生该事件的（子）agent 标识，供审计/追踪。
         """
         sess = await self.db.get(SessionRow, session_id)
         if sess is None:
@@ -69,13 +75,18 @@ class SessionStore:
             role=role.value if role else None,
             message_id=message_id,
             content=_dump_content(content),
+            is_sidechain=is_sidechain,
+            agent_id_ref=agent_id_ref,
             seq=next_seq,
         )
         self.db.add(row)
         await self.db.flush()
 
-        sess.head_event_id = row.id
-        await self.db.flush()
+        # sidechain 不改 head：父投影从 head 沿 parent 回溯，若 head 跳到 sidechain，
+        # 后续父事件的 parent 会指向 sidechain，从而把子过程"拉进"父投影。
+        if not is_sidechain:
+            sess.head_event_id = row.id
+            await self.db.flush()
         return row.id
 
     async def list_events(self, session_id: uuid.UUID) -> list[SessionEvent]:
