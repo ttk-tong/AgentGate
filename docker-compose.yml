@@ -20,7 +20,7 @@ services:
     image: redis:7-alpine
     container_name: agentgate-redis
     ports:
-      - "6379:6379"
+      - "16379:6379"
     volumes:
       - agentgate_redisdata:/data
     healthcheck:

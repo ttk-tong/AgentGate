@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import AsyncIterator
 from uuid import uuid4
@@ -49,6 +50,7 @@ from app.orchestration.tool_executor import (
 )
 from app.orchestration.tools.base import ToolRegistry
 from app.routing.providers.base import Provider
+from app.resilience.retry import RetryPolicy, call_with_retry
 
 log = get_logger("agent_loop")
 
@@ -80,6 +82,7 @@ class AgentLoop:
         prompt_composer=None,
         external_user: str | None = None,
         tenant_id: str | None = None,
+        circuit=None,
     ):
         self.store = store
         self.provider = provider
@@ -102,6 +105,7 @@ class AgentLoop:
         self.prompt_composer = prompt_composer
         self.external_user = external_user
         self.tenant_id = tenant_id
+        self.circuit = circuit
 
     def _tools_schema(self) -> list[dict]:
         if self.registry is None:
@@ -117,6 +121,38 @@ class AgentLoop:
         if st.output_recovery_count == 0:
             return base
         return min(base * (2 ** st.output_recovery_count), base * 4)
+
+    async def _stream_with_retry(self, request: LLMRequest) -> AsyncIterator:
+        """Retry only before emitting a provider chunk; emitted streams are not replayable."""
+        class _NoRetryOverload(Exception):
+            def __str__(self) -> str:
+                return "provider overloaded"
+
+        async def start(_provider: str, _model: str):
+            try:
+                stream = self.provider.stream(request)
+                return await anext(stream), stream
+            except ProviderOverloaded as exc:
+                # Preserve model fallback semantics; overload selects another model,
+                # while transport failures use the bounded retry policy.
+                raise _NoRetryOverload() from exc
+
+        try:
+            first, stream = await call_with_retry(
+                [(getattr(self.provider, "name", "configured"), request.model)],
+                start,
+                policy=RetryPolicy.foreground(),
+                sleep=asyncio.sleep,
+                now=time.monotonic,
+                circuit=self.circuit,
+            )
+        except ProviderUnavailable as exc:
+            if str(exc) == "provider overloaded":
+                raise ProviderOverloaded("provider overloaded") from exc
+            raise
+        yield first
+        async for chunk in stream:
+            yield chunk
 
     async def run(self, session_id, user_text: str) -> AsyncIterator[Event]:
         """驱动一次用户输入的完整运行，产出对外 Event 流。"""
@@ -184,7 +220,8 @@ class AgentLoop:
         seq = 0
 
         # 被拒绝的调用不执行，直接构造拒绝结果；其余照常执行（已确认的放行）
-        to_run = [c for c in pending_calls if c.id not in rejected_ids]
+        # A confirmation is scoped to one tool call. Never implicitly approve the rest.
+        to_run = [c for c in pending_calls if c.id in approved_ids]
         results_by_id: dict[str, ToolResult] = {
             c.id: ToolResult(
                 ok=False,
@@ -195,6 +232,14 @@ class AgentLoop:
             for c in pending_calls
             if c.id in rejected_ids
         }
+        for call in pending_calls:
+            if call.id not in approved_ids and call.id not in rejected_ids:
+                results_by_id[call.id] = ToolResult(
+                    ok=False,
+                    content={"error": "confirmation not granted", "code": "confirmation_required"},
+                    error="confirmation not granted",
+                    error_code="confirmation_required",
+                )
 
         if to_run:
             ctx = ToolContext(session_id=str(session_id), agent_id=self.model)
@@ -272,7 +317,7 @@ class AgentLoop:
             finish_reason = "stop"
             emitted_any = False
             try:
-                async for chunk in self.provider.stream(request):
+                async for chunk in self._stream_with_retry(request):
                     if chunk.type == "text" and chunk.text:
                         text_acc += chunk.text
                         emitted_any = True

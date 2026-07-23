@@ -21,8 +21,10 @@ class SessionStore:
     def __init__(self, db: AsyncSession):
         self.db = db
 
-    async def create_session(self, external_user: str | None = None) -> uuid.UUID:
-        row = SessionRow(external_user=external_user)
+    async def create_session(
+        self, external_user: str | None = None, tenant_id: uuid.UUID | None = None
+    ) -> uuid.UUID:
+        row = SessionRow(external_user=external_user, tenant_id=tenant_id)
         self.db.add(row)
         await self.db.flush()
         return row.id
@@ -50,7 +52,9 @@ class SessionStore:
             后续父消息会挂到 sidechain 之下，把子 agent 中间过程"拉进"父投影。
         agent_id_ref：产生该事件的（子）agent 标识，供审计/追踪。
         """
-        sess = await self.db.get(SessionRow, session_id)
+        sess = await self.db.scalar(
+            select(SessionRow).where(SessionRow.id == session_id).with_for_update()
+        )
         if sess is None:
             raise ValueError(f"session not found: {session_id}")
 

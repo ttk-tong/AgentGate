@@ -9,7 +9,16 @@ payload 约定：{"session_id": str, "seq_from": int, "seq_to": int}
 """
 from __future__ import annotations
 
+from uuid import UUID
+
+from app.context.memory.recall import MemoryService
+from app.context.memory.store import DbMemoryStore
+from app.context.session_store import SessionStore
+from app.domain.enums import Role
+from app.domain.memory import MemoryDraft, MemoryKind, MemoryScope
+
 from app.observability.logging import get_logger
+from app.persistence.db import get_sessionmaker
 
 _log = get_logger("handler.memory")
 
@@ -20,10 +29,39 @@ async def handle_memory_extract(payload: dict) -> None:
         # 参数错误：重试无意义，交给 Worker 归为 fatal 进 DLQ
         raise ValueError("memory.extract requires session_id")
 
+    try:
+        sid = UUID(str(session_id))
+    except ValueError as exc:
+        raise ValueError("memory.extract session_id must be a UUID") from exc
+    async with get_sessionmaker()() as db:
+        store = SessionStore(db)
+        session = await store.get_session(sid)
+        if session is None:
+            raise ValueError("memory.extract session not found")
+        events = await store.list_events(sid)
+        texts = [
+            block.text
+            for event in events
+            if event.role == Role.user and event.content
+            for block in event.content
+            if block.type == "text" and block.text
+        ]
+        if texts:
+            await MemoryService(DbMemoryStore(db)).form([
+                MemoryDraft(
+                    scope=MemoryScope.session,
+                    scope_key=str(sid),
+                    kind=MemoryKind.event,
+                    content=" ".join(texts)[-2000:],
+                    importance=0.4,
+                    tenant_id=str(session.tenant_id) if session.tenant_id else None,
+                )
+            ])
+        await db.commit()
+
     _log.info(
         "memory.extract",
         session_id=session_id,
         seq_from=payload.get("seq_from"),
         seq_to=payload.get("seq_to"),
     )
-    # TODO(Stage 6)：抽取候选记忆 → 向量化 → upsert 到 memory_item（幂等 upsert）。

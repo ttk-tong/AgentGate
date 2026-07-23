@@ -37,6 +37,10 @@ from app.orchestration.tools import attach_spawn_agent, build_default_registry
 from app.persistence.db import get_db
 from app.persistence.redis_client import get_redis
 from app.routing.factory import get_provider
+from app.routing.model_router import Capability, ModelRouter
+from app.resilience.circuit_breaker import CircuitBreaker
+from app.resilience.redis_stores import RedisCircuitStore
+from app.security.authz import authorize
 
 # 技能注册表：进程内单例，首次用时按 settings.skills_dir 扫描 SKILL.md（plan/07 §4）。
 _SKILL_REGISTRY: SkillRegistry | None = None
@@ -88,7 +92,10 @@ async def create_session(
     principal: Principal = Depends(enforce_rate_limit),
 ) -> CreateSessionResponse:
     store = SessionStore(db)
-    sid = await store.create_session(external_user=body.external_user)
+    authorize(principal, "sessions:write")
+    sid = await store.create_session(
+        external_user=body.external_user, tenant_id=principal.tenant_id
+    )
     return CreateSessionResponse(session_id=sid)
 
 
@@ -110,7 +117,9 @@ def _get_skill_registry() -> SkillRegistry | None:
     return reg
 
 
-async def _build_loop(db: AsyncSession, session_id: uuid.UUID | None = None) -> AgentLoop:
+async def _build_loop(
+    db: AsyncSession, session_id: uuid.UUID | None = None, redis: Redis | None = None
+) -> AgentLoop:
     """装配 Agent Loop。阶段 6：按配置挂上记忆服务 + 提示词分层组装器。
 
     session_id 给定时读取会话的 external_user / tenant_id，供记忆召回的 scope
@@ -122,6 +131,14 @@ async def _build_loop(db: AsyncSession, session_id: uuid.UUID | None = None) -> 
     fallbacks = [m.strip() for m in settings.fallback_models.split(",") if m.strip()]
     registry = build_default_registry()
     provider = get_provider()
+    route = ModelRouter(getattr(provider, "name", "configured"), settings.default_model).resolve(
+        Capability(tools=bool(registry.names())),
+        policy={
+            "provider": getattr(provider, "name", "configured"),
+            "model": settings.default_model,
+            "fallbacks": [(getattr(provider, "name", "configured"), model) for model in fallbacks],
+        },
+    )
 
     # —— 阶段 7：注入子 agent 执行体，并挂载 spawn_agent 工具（plan/03 §8、04 §8）——
     # session_id 为 None（如果未来出现无 session 的调用路径）就不挂 spawn_agent。
@@ -155,15 +172,16 @@ async def _build_loop(db: AsyncSession, session_id: uuid.UUID | None = None) -> 
     return AgentLoop(
         store=store,
         provider=provider,
-        model=settings.default_model,
+        model=route.model,
         system_prompt=settings.default_system_prompt,
         registry=registry,
         summary_model=settings.summary_model or None,
-        fallback_models=fallbacks or None,
+        fallback_models=[model for _, model in route.fallbacks] or None,
         memory=memory,
         prompt_composer=composer,
         external_user=external_user,
         tenant_id=tenant_id,
+        circuit=CircuitBreaker(RedisCircuitStore(redis)) if redis is not None else None,
     )
 
 
@@ -179,10 +197,16 @@ async def _load_pending(redis: Redis, session_id: uuid.UUID) -> list[ToolCall] |
     return [ToolCall(**c) for c in json.loads(raw)]
 
 
-async def _ensure_session(db: AsyncSession, session_id: uuid.UUID) -> None:
+async def _ensure_session(
+    db: AsyncSession, session_id: uuid.UUID, principal: Principal, action: str
+) -> None:
     store = SessionStore(db)
-    if await store.get_session(session_id) is None:
+    session = await store.get_session(session_id)
+    if session is None:
         raise HTTPException(status_code=404, detail="session not found")
+    if session.tenant_id is None:
+        raise HTTPException(status_code=403, detail="session is not tenant-bound")
+    authorize(principal, action, session.tenant_id)
 
 
 @router.post("/sessions/{session_id}/messages", response_model=MessageResponse)
@@ -194,8 +218,8 @@ async def post_message(
     principal: Principal = Depends(enforce_rate_limit),
 ) -> MessageResponse:
     """非流式：内部消费 Loop 事件流，聚合成一次性响应。"""
-    await _ensure_session(db, session_id)
-    loop = await _build_loop(db, session_id)
+    await _ensure_session(db, session_id, principal, "sessions:write")
+    loop = await _build_loop(db, session_id, redis)
 
     try:
         async with session_lock(redis, session_id):
@@ -257,18 +281,21 @@ async def post_message_stream(
     principal: Principal = Depends(enforce_rate_limit),
 ) -> StreamingResponse:
     """SSE 流式：每个 Loop Event 作为一个 SSE 事件推给客户端。"""
-    await _ensure_session(db, session_id)
-    loop = await _build_loop(db, session_id)
+    await _ensure_session(db, session_id, principal, "sessions:write")
+    loop = await _build_loop(db, session_id, redis)
 
     async def event_gen() -> AsyncIterator[str]:
         try:
             async with session_lock(redis, session_id):
                 try:
                     async for ev in loop.run(session_id, body.content):
+                        if ev.type == "done":
+                            await db.commit()
                         yield _sse(ev)
                 except ConfirmationPending as e:
                     # tool_confirmation 事件已在 Loop 内产出；此处存盘待执行调用
                     await _save_pending(redis, session_id, e.calls)
+                    await db.commit()
         except SessionBusyError:
             busy = Event.error("session is busy", retryable=True, seq=0)
             yield _sse(busy)
@@ -286,20 +313,23 @@ async def post_confirmation(
     body: ConfirmationRequest,
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
+    principal: Principal = Depends(enforce_rate_limit),
 ) -> MessageResponse:
     """批准/拒绝 dangerous 工具后恢复 Loop（plan/04 §6）。
 
     批准 → 该 call 跳过确认关卡执行；拒绝 → 以"用户拒绝"结果回填，让 LLM 另作打算。
     两种情况都恢复运行直到自然结束（或再次挂起）。
     """
-    await _ensure_session(db, session_id)
+    await _ensure_session(db, session_id, principal, "sessions:write")
     pending = await _load_pending(redis, session_id)
     if pending is None:
         raise HTTPException(status_code=409, detail="no pending confirmation")
+    if body.tool_call_id not in {call.id for call in pending}:
+        raise HTTPException(status_code=409, detail="confirmation does not match pending call")
 
     approved = {body.tool_call_id} if body.approved else set()
     rejected = set() if body.approved else {body.tool_call_id}
-    loop = await _build_loop(db, session_id)
+    loop = await _build_loop(db, session_id, redis)
 
     try:
         async with session_lock(redis, session_id):

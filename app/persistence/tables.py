@@ -20,6 +20,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
     text,
 )
@@ -257,6 +258,7 @@ class SessionEventRow(Base):
 
     __table_args__ = (
         Index("ix_event_session", "session_id", "seq"),
+        UniqueConstraint("session_id", "seq", name="uq_session_event_session_seq"),
         Index("ix_event_parent", "parent_id"),
         Index("ix_event_message", "session_id", "message_id"),
     )

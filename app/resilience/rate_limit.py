@@ -107,6 +107,11 @@ class RateLimiter:
     ) -> RateDecision:
         """令牌桶扣减一次。取不到令牌 → 限流，retry_after = 补足所需时间。"""
         key = self._bucket_key(tenant_id)
+        atomic_consume = getattr(self._store, "consume_bucket", None)
+        if atomic_consume is not None:
+            allowed, tokens = await atomic_consume(key, now=now, qps=quota.qps, burst=quota.burst, cost=cost)
+            retry_after = (cost - tokens) / quota.qps if not allowed and quota.qps > 0 else None
+            return RateDecision(allowed, None if allowed else "qps_exceeded", retry_after)
         bucket = await self._store.get_bucket(key)
         if bucket is None:
             bucket = _Bucket(tokens=float(quota.burst), updated_at=now)
@@ -128,6 +133,11 @@ class RateLimiter:
     ) -> RateDecision:
         """占用一个并发槽位。超过 max_concurrency → 限流（须与 release_slot 配对）。"""
         key = self._conc_key(tenant_id)
+        atomic_acquire = getattr(self._store, "acquire_concurrency", None)
+        if atomic_acquire is not None:
+            if await atomic_acquire(key, quota.max_concurrency):
+                return RateDecision(allowed=True)
+            return RateDecision(allowed=False, reason="concurrency_exceeded", retry_after=1.0)
         count = await self._store.incr_concurrency(key)
         if count > quota.max_concurrency:
             # 超限：立刻回退自己刚占的槽位，不泄漏计数

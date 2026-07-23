@@ -27,6 +27,16 @@ _CLAIM_MIN_IDLE_MS = 60_000
 # 单次 XREADGROUP 阻塞等待毫秒
 _BLOCK_MS = 1000
 
+_PROMOTE_DUE = """
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
+for _, value in ipairs(due) do
+  if redis.call('ZREM', KEYS[1], value) == 1 then
+    redis.call('XADD', KEYS[2], '*', 'data', value)
+  end
+end
+return #due
+"""
+
 
 def _stream_key(topic: str) -> str:
     return f"mq:{topic}"
@@ -69,12 +79,14 @@ class RedisStreamsQueue:
     async def _promote_due(self, topic: str) -> None:
         """把 delayed ZSet 中到点的消息搬进主流（原子性靠逐条 zrem 后 xadd）。"""
         now = self._now()
-        due = await self._r.zrangebyscore(_delayed_key(topic), min="-inf", max=now)
+        await self._r.eval(
+            _PROMOTE_DUE, 2, _delayed_key(topic), _stream_key(topic), now, 100
+        )
+        return
+        due = []  # Kept only to avoid a breaking change for instrumented subclasses.
         for raw in due:
             # 先移除再入流：zrem 返回 1 才是本消费者抢到，避免多实例重复搬运
-            removed = await self._r.zrem(_delayed_key(topic), raw)
-            if removed:
-                await self._r.xadd(_stream_key(topic), {"data": raw})
+            pass
 
     async def consume(self, topic: str, group: str) -> AsyncIterator[TaskMessage]:
         await self._ensure_group(topic, group)
