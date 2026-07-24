@@ -29,6 +29,32 @@ services:
       timeout: 3s
       retries: 10
 
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: agentgate-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./ops/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - agentgate_promdata:/prometheus
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: agentgate-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - agentgate_grafanadata:/var/lib/grafana
+    depends_on:
+      - prometheus
+
 volumes:
   agentgate_pgdata:
   agentgate_redisdata:
+  agentgate_promdata:
+  agentgate_grafanadata:

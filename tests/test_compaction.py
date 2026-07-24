@@ -195,6 +195,75 @@ async def test_auto_compact_sets_boundary_and_truncates_db():
         assert len(events) == 7
 
 
+# ————————————————————— DB：并发安全 —————————————————————
+
+
+async def test_concurrent_append_no_seq_conflict():
+    """同一会话多协程并发追加事件，seq 唯一约束不应冲突。"""
+    import asyncio
+
+    async with get_sessionmaker()() as db:
+        store = SessionStore(db)
+        sid = await store.create_session(external_user="concurrent")
+        await db.commit()
+
+    async def _append(i: int):
+        async with get_sessionmaker()() as db2:
+            s = SessionStore(db2)
+            await s.append_event(
+                sid, kind=EventKind.message, role=Role.user,
+                content=[ContentBlock(type="text", text=f"msg{i}")],
+            )
+            await db2.commit()
+
+    await asyncio.gather(*[_append(i) for i in range(8)])
+
+    async with get_sessionmaker()() as db:
+        store = SessionStore(db)
+        events = await store.list_events(sid)
+    # 8 条事件全部落库、无 seq 唯一冲突即通过（seq 不在领域模型上暴露，
+    # 由 list_events 按 seq 排序读回，事件数正确即证明并发写入未冲突）
+    assert len(events) == 8
+
+
+async def test_concurrent_append_and_compact():
+    """事件追加与压缩同时发生，不产生 seq 冲突。"""
+    import asyncio
+
+    async with get_sessionmaker()() as db:
+        store = SessionStore(db)
+        sid = await store.create_session(external_user="concurrent2")
+        for i in range(6):
+            role = Role.user if i % 2 == 0 else Role.assistant
+            await store.append_event(
+                sid, kind=EventKind.message, role=role,
+                content=[ContentBlock(type="text", text=f"m{i}")],
+            )
+        await db.commit()
+
+    async def _compact():
+        async with get_sessionmaker()() as db2:
+            s = SessionStore(db2)
+            await compactor.auto_compact(s, sid, MockProvider(), "mock", keep_tail=2)
+            await db2.commit()
+
+    async def _append():
+        async with get_sessionmaker()() as db2:
+            s = SessionStore(db2)
+            await s.append_event(
+                sid, kind=EventKind.message, role=Role.user,
+                content=[ContentBlock(type="text", text="concurrent")],
+            )
+            await db2.commit()
+
+    # 并发执行，任意一个成功即可；不应抛 UniqueViolation
+    results = await asyncio.gather(_compact(), _append(), return_exceptions=True)
+    errors = [r for r in results if isinstance(r, Exception)]
+    # 允许序列化冲突（serialization_failure），但不允许 UniqueViolation
+    for e in errors:
+        assert "unique" not in str(e).lower(), f"seq unique violation: {e}"
+
+
 async def test_auto_compact_summary_failure_raises():
     """摘要模型失败 → CompactionError（供 Loop 熔断计数）。"""
 

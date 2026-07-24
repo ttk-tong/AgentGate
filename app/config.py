@@ -32,6 +32,12 @@ class Settings(BaseSettings):
         default="postgresql+asyncpg://agentgate:agentgate@localhost:5432/agentgate"
     )
     redis_url: str = Field(default="redis://localhost:6379/0")
+    # —— 连接池与韧性（压测暴露：默认池 15 在并发下耗尽，Redis 抖动会阻塞主链路）——
+    db_pool_size: int = 20
+    db_max_overflow: int = 40
+    db_pool_timeout_s: float = 10.0
+    # 限流/熔断的 Redis 调用超时；超时即快速失败（fail-open），不拖垮主链路。
+    redis_timeout_s: float = 0.5
 
     # —— Provider ——
     anthropic_api_key: str = ""

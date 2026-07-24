@@ -165,7 +165,9 @@ class SessionStore:
 
         注意 boundary 的 seq 要落在被摘要历史与保留尾部之间，保证投影链顺序正确。
         """
-        sess = await self.db.get(SessionRow, session_id)
+        sess = await self.db.scalar(
+            select(SessionRow).where(SessionRow.id == session_id).with_for_update()
+        )
         if sess is None:
             raise ValueError(f"session not found: {session_id}")
 
@@ -175,17 +177,15 @@ class SessionStore:
             if tail_row is None:
                 raise ValueError(f"event not found: {reparent_event_id}")
 
-        # boundary 的 seq：紧挨在保留尾部第一条之前（若无尾部则取当前最大 seq+1）
-        if tail_row is not None:
-            boundary_seq = tail_row.seq - 1
-        else:
-            max_seq = await self.db.scalar(
-                select(SessionEventRow.seq)
-                .where(SessionEventRow.session_id == session_id)
-                .order_by(SessionEventRow.seq.desc())
-                .limit(1)
-            )
-            boundary_seq = (max_seq or 0) + 1
+        # boundary seq: always max+1，避免与已有事件冲突（seq 仅用于写入顺序/审计，
+        # 逻辑顺序由 DAG 父指针决定）
+        max_seq = await self.db.scalar(
+            select(SessionEventRow.seq)
+            .where(SessionEventRow.session_id == session_id)
+            .order_by(SessionEventRow.seq.desc())
+            .limit(1)
+        )
+        boundary_seq = (max_seq or 0) + 1
 
         row = SessionEventRow(
             session_id=session_id,

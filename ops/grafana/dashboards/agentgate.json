@@ -1,0 +1,59 @@
+{
+  "title": "AgentGate",
+  "uid": "agentgate-main",
+  "schemaVersion": 38,
+  "refresh": "15s",
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "QPS",
+      "gridPos": {"x":0,"y":0,"w":4,"h":4},
+      "targets": [{"expr": "sum(rate(http_requests_total[1m]))", "legendFormat": "req/s"}]
+    },
+    {
+      "id": 2, "type": "stat", "title": "Error Rate",
+      "gridPos": {"x":4,"y":0,"w":4,"h":4},
+      "targets": [{"expr": "sum(rate(http_requests_total{status=~'5..'}[5m])) / sum(rate(http_requests_total[5m]))", "legendFormat": "5xx rate"}]
+    },
+    {
+      "id": 3, "type": "stat", "title": "Active SSE",
+      "gridPos": {"x":8,"y":0,"w":4,"h":4},
+      "targets": [{"expr": "sse_active_connections", "legendFormat": "connections"}]
+    },
+    {
+      "id": 4, "type": "timeseries", "title": "HTTP P95 Latency",
+      "gridPos": {"x":0,"y":4,"w":12,"h":8},
+      "targets": [{"expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, path))", "legendFormat": "{{path}}"}]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "First Token P95",
+      "gridPos": {"x":12,"y":4,"w":12,"h":8},
+      "targets": [{"expr": "histogram_quantile(0.95, sum(rate(agent_first_token_seconds_bucket[5m])) by (le))", "legendFormat": "p95"}]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Tool Calls",
+      "gridPos": {"x":0,"y":12,"w":12,"h":8},
+      "targets": [{"expr": "sum(rate(tool_calls_total[5m])) by (tool, status)", "legendFormat": "{{tool}} {{status}}"}]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "Provider Retries & Circuit Opens",
+      "gridPos": {"x":12,"y":12,"w":12,"h":8},
+      "targets": [
+        {"expr": "sum(rate(provider_retry_total[5m])) by (provider)", "legendFormat": "retry {{provider}}"},
+        {"expr": "sum(rate(provider_circuit_open_total[5m])) by (provider)", "legendFormat": "circuit {{provider}}"}
+      ]
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "Compactions",
+      "gridPos": {"x":0,"y":20,"w":12,"h":8},
+      "targets": [{"expr": "sum(rate(agent_compact_total[5m])) by (layer)", "legendFormat": "{{layer}}"}]
+    },
+    {
+      "id": 9, "type": "timeseries", "title": "Queue Depth & DLQ",
+      "gridPos": {"x":12,"y":20,"w":12,"h":8},
+      "targets": [
+        {"expr": "queue_depth", "legendFormat": "depth {{queue}}"},
+        {"expr": "sum(rate(dlq_total[5m])) by (queue)", "legendFormat": "dlq {{queue}}"}
+      ]
+    }
+  ]
+}

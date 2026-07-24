@@ -11,6 +11,7 @@ from app.api.middleware.request_id import TraceMiddleware
 from app.api.v1.chat import router as chat_router
 from app.config import get_settings
 from app.observability.logging import configure_logging, get_logger
+from app.observability.metrics import PrometheusMiddleware, metrics_route
 from app.persistence.db import dispose_engine
 from app.persistence.redis_client import close_redis
 
@@ -84,10 +85,12 @@ def create_app() -> FastAPI:
             allow_methods=["*"],
             allow_headers=["*"],
         )
+    app.add_middleware(PrometheusMiddleware)
     app.add_middleware(TraceMiddleware)
     _register_exception_handlers(app)
     app.include_router(health_router)
     app.include_router(chat_router)
+    app.routes.append(metrics_route)
     return app
 
 
