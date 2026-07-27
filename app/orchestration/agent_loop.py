@@ -31,7 +31,8 @@ from app.domain.events import Event
 from app.domain.llm import LLMRequest, ToolCall, Usage
 from app.domain.models import ContentBlock
 from app.domain.tool import ContextMutation, ToolContext, ToolResult
-from app.observability.logging import get_logger
+from app.observability.logging import get_logger, get_trace_id
+from app.observability.tracing import get_tracer, start_span
 from app.orchestration.state import (
     STOP_COMPACT_FAILED,
     STOP_COMPLETED,
@@ -53,6 +54,7 @@ from app.routing.providers.base import Provider
 from app.resilience.retry import RetryPolicy, call_with_retry
 
 log = get_logger("agent_loop")
+tracer = get_tracer("agentgate.agent_loop")
 
 
 class ConfirmationPending(Exception):
@@ -273,8 +275,36 @@ class AgentLoop:
             yield ev
 
     async def _drive(self, session_id) -> AsyncIterator[Event]:
-        """主循环。假定新输入（user 消息或工具结果）已落库在 head。"""
+        """主循环。假定新输入（user 消息或工具结果）已落库在 head。
+
+        一次 run 一个根 span；PRE_CALL/LLM_CALL/TOOL_EXEC 各成子 span，
+        在 Jaeger/Tempo 里呈现完整火焰图。app.trace_id 关联结构化日志。
+        """
         st = LoopState(session_id=session_id, current_model=self.model)
+        run_span = start_span(
+            tracer,
+            "agent.run",
+            attributes={
+                "session.id": str(session_id),
+                "llm.model": self.model,
+                "app.trace_id": get_trace_id() or "",
+            },
+        )
+        try:
+            async for ev in self._drive_turns(session_id, st, run_span):
+                yield ev
+        except BaseException as e:
+            run_span.record_exception(e)
+            raise
+        finally:
+            run_span.set_attribute("agent.turns", st.turn)
+            run_span.set_attribute("agent.stop_reason", st.stop_reason or "")
+            run_span.set_attribute("agent.tool_calls", st.tool_calls_made)
+            run_span.end()
+
+    async def _drive_turns(
+        self, session_id, st: LoopState, run_span
+    ) -> AsyncIterator[Event]:
         seq = 0
         deadline = time.monotonic() + self.cfg.wall_timeout_s
         tools_schema = self._tools_schema()
@@ -291,13 +321,23 @@ class AgentLoop:
 
             # —— PRE_CALL：预算检查 →（必要时）压缩，再投影上下文（plan/05 §7、03 §4）——
             st.phase = LoopPhase.pre_call
-            async for ev, aborted in self._pre_call_compact(session_id, st, tools_schema, seq):
-                seq = ev.seq
-                yield ev
-                if aborted:
-                    return
+            pre_span = start_span(
+                tracer, "agent.pre_call", parent=run_span,
+                attributes={"agent.turn": st.turn},
+            )
+            try:
+                async for ev, aborted in self._pre_call_compact(session_id, st, tools_schema, seq):
+                    seq = ev.seq
+                    if ev.type == "compact":
+                        pre_span.set_attribute("compact.layer", ev.data.get("layer", ""))
+                        pre_span.set_attribute("compact.freed_tokens", ev.data.get("freed_tokens", 0))
+                    yield ev
+                    if aborted:
+                        return
 
-            messages = await self.store.load_projection(session_id)
+                messages = await self.store.load_projection(session_id)
+            finally:
+                pre_span.end()
             request = LLMRequest(
                 model=st.current_model,
                 system=self.system_prompt,
@@ -316,6 +356,10 @@ class AgentLoop:
             call_usage = Usage()
             finish_reason = "stop"
             emitted_any = False
+            llm_span = start_span(
+                tracer, "agent.llm_call", parent=run_span,
+                attributes={"agent.turn": st.turn, "llm.model": st.current_model},
+            )
             try:
                 async for chunk in self._stream_with_retry(request):
                     if chunk.type == "text" and chunk.text:
@@ -329,7 +373,9 @@ class AgentLoop:
                         call_usage = chunk.usage
                     elif chunk.type == "finish":
                         finish_reason = chunk.finish_reason or "stop"
-            except PromptTooLong:
+            except PromptTooLong as e:
+                llm_span.record_exception(e)
+                llm_span.end()
                 # 已经用过反应式压缩仍超限 → 放弃（不重复烧钱）
                 if st.attempted_reactive_compact:
                     yield _abort(st, STOP_PROMPT_TOO_LONG, seq)
@@ -347,11 +393,18 @@ class AgentLoop:
                 st.turn -= 1  # 本轮不计数：413 未产出任何 assistant 响应
                 continue
             except ProviderOverloaded as e:
+                llm_span.record_exception(e)
+                llm_span.end()
                 # 过载：首字节前才能安全重跑（错误抑制，plan/02 §3.2）。
                 # 已产出 token → 不可重试，以 error 帧结束。
                 if emitted_any:
                     seq += 1
-                    yield Event.error(f"provider overloaded mid-stream: {e}", retryable=False, seq=seq)
+                    yield Event.error(
+                        f"provider overloaded mid-stream: {e}",
+                        retryable=False,
+                        seq=seq,
+                        code="provider_overloaded",
+                    )
                     return
                 # 模型降级重跑，次数上限 guard（plan/03 §5）
                 if st.model_fallbacks_used >= len(self.fallback_models):
@@ -369,6 +422,12 @@ class AgentLoop:
                 st.current_model = next_model
                 st.turn -= 1  # 本轮不计数：过载未产出响应
                 continue
+
+            llm_span.set_attribute("llm.finish_reason", finish_reason)
+            llm_span.set_attribute("llm.input_tokens", call_usage.input_tokens)
+            llm_span.set_attribute("llm.output_tokens", call_usage.output_tokens)
+            llm_span.set_attribute("llm.tool_calls", len(tool_calls))
+            llm_span.end()
 
             st.usage = st.usage + call_usage
             seq += 1
@@ -438,6 +497,14 @@ class AgentLoop:
                 yield Event.tool_call(tc.id, tc.name, tc.arguments, seq)
 
             ctx = ToolContext(session_id=str(session_id), agent_id=self.model)
+            tool_span = start_span(
+                tracer, "agent.tool_exec", parent=run_span,
+                attributes={
+                    "agent.turn": st.turn,
+                    "tool.count": len(tool_calls),
+                    "tool.names": ",".join(tc.name for tc in tool_calls),
+                },
+            )
             try:
                 results = await execute_batched(
                     tool_calls,
@@ -446,6 +513,8 @@ class AgentLoop:
                     apply_mutation=self._make_applier(session_id),
                 )
             except ConfirmationRequired as e:
+                tool_span.set_attribute("tool.confirmation_pending", e.call.name)
+                tool_span.end()
                 # dangerous 工具：挂起会话，产出确认事件，交由 confirmations 接口恢复
                 await self.store.set_state(session_id, SessionState.waiting_confirmation)
                 seq += 1
@@ -453,6 +522,7 @@ class AgentLoop:
                     e.call.id, e.call.name, e.call.arguments, e.reason, seq
                 )
                 raise ConfirmationPending(tool_calls, e.call, e.reason) from None
+            tool_span.end()
 
             st.tool_calls_made += len(tool_calls)
 

@@ -39,6 +39,14 @@ class Settings(BaseSettings):
     # 限流/熔断的 Redis 调用超时；超时即快速失败（fail-open），不拖垮主链路。
     redis_timeout_s: float = 0.5
 
+    # —— OpenTelemetry Tracing（metrics/logs 之外的第三支柱）——
+    # otel_enabled=true 且配置 OTLP 端点时，HTTP 请求与 AgentLoop 各阶段
+    # （PRE_CALL/LLM_CALL/TOOL_EXEC）打成 span 导出（Jaeger/Tempo）。
+    otel_enabled: bool = False
+    otel_service_name: str = "agentgate"
+    # OTLP HTTP 端点（如 http://jaeger:4318）；留空则只建 provider 不导出。
+    otel_exporter_otlp_endpoint: str = ""
+
     # —— Provider ——
     anthropic_api_key: str = ""
     # OpenAI 兼容端点（如 DeepSeek 代理）：base_url 需含 /v1，走 /chat/completions

@@ -8,6 +8,19 @@
       name="description"
       content="AgentGate — 把 LLM 调用变成可观察的 Agent Runtime：事件 DAG、子 Agent 隔离、上下文压缩、记忆持久化。"
     />
+    <script>
+      // 首帧定主题，避免深浅色闪烁；逻辑与 src/theme.ts 保持一致。
+      (function () {
+        var saved = localStorage.getItem("agentgate.theme");
+        var theme =
+          saved === "dark" || saved === "light"
+            ? saved
+            : window.matchMedia("(prefers-color-scheme: light)").matches
+              ? "light"
+              : "dark";
+        document.documentElement.dataset.theme = theme;
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

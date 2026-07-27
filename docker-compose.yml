@@ -29,6 +29,71 @@ services:
       timeout: 3s
       retries: 10
 
+  app:
+    build: .
+    image: agentgate:latest
+    container_name: agentgate-app
+    environment:
+      APP_ENV: dev                    # dev：启动时自动 alembic upgrade head 建表
+      DATABASE_URL: postgresql+asyncpg://agentgate:agentgate@postgres:5432/agentgate
+      REDIS_URL: redis://redis:6379/0
+      # Provider 凭证从宿主机环境透传（都留空则用 Mock 回声，开箱即跑）
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DEFAULT_MODEL: ${DEFAULT_MODEL:-claude-opus-4-8}
+      # —— 认证/限流 ——
+      # 默认强制认证：无凭证一律 401，复现生产鉴权行为。临时敞开设 AUTH_REQUIRED=false。
+      AUTH_REQUIRED: ${AUTH_REQUIRED:-true}
+      # API Key 哈希盐：seed_api_key 在本容器内跑，天然与服务端同盐。生产务必改掉。
+      AUTH_SALT: ${AUTH_SALT:-dev-insecure-salt-change-me}
+      # OTel tracing：导出到 jaeger（OTLP HTTP）。设 OTEL_ENABLED=false 关闭。
+      OTEL_ENABLED: ${OTEL_ENABLED:-true}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+
+  worker:
+    image: agentgate:latest
+    container_name: agentgate-worker
+    command: ["python", "-m", "app.async_.main"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://agentgate:agentgate@postgres:5432/agentgate
+      REDIS_URL: redis://redis:6379/0
+      SCHEDULER_ENABLED: "true"       # 定时任务：抢分布式锁去重后入队
+      # OTel：worker 处理后台任务的 span 与 API 主链路共用一个 Jaeger，
+      # 一套 trace 视图看清「对话主链路 / 后台任务」的解耦执行。
+      OTEL_ENABLED: ${OTEL_ENABLED:-true}
+      OTEL_SERVICE_NAME: agentgate-worker
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+    healthcheck:
+      disable: true                   # worker 无 HTTP 端口，禁用镜像默认探针
+    depends_on:
+      app:
+        condition: service_started    # 复用 app 构建的镜像；表由 app 启动时迁移
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: agentgate-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"                 # UI：一次 agent run 的完整火焰图
+      - "4318:4318"                   # OTLP HTTP 接收端
+
   prometheus:
     image: prom/prometheus:latest
     container_name: agentgate-prometheus

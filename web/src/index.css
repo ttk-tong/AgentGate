@@ -4,8 +4,54 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
+/* ——— 主题变量（RGB 三元组，配合 tailwind.config.js 的 rgb(var()/alpha)） ———
+   深色是默认；html[data-theme="light"] 覆盖为浅色。
+   主题由 src/theme.ts 决定：localStorage 优先，其次 prefers-color-scheme。 */
+:root,
+html[data-theme="dark"] {
   color-scheme: dark;
+  --paper: 241 237 228; /* #F1EDE4 手册纸色 */
+  --console: 14 16 19; /* #0E1013 控制台深底 */
+  --panel: 20 23 28; /* #14171C 内层卡片 */
+  --rule: 35 38 48; /* #232630 分割线 */
+  --ink: 232 228 218; /* #E8E4DA 主文字 */
+  --dim: 122 123 130; /* #7A7B82 次文字 */
+  --signal: 184 255 61; /* #B8FF3D 荧光柠檬绿 */
+  --warn: 255 180 84; /* #FFB454 琥珀 */
+  --fault: 255 93 98; /* #FF5D62 错误 */
+  --paper-ink: 26 23 18;
+  --paper-dim: 114 106 90;
+  --paper-rule: 216 209 194;
+  --ev-token: 122 123 130;
+  --ev-tool: 91 156 255; /* #5B9CFF */
+  --ev-result: 184 255 61;
+  --ev-error: 255 93 98;
+  --ev-compact: 176 140 255; /* #B08CFF */
+  --ev-sidechain: 255 180 84;
+  --ev-done: 122 123 130;
+}
+
+html[data-theme="light"] {
+  color-scheme: light;
+  --paper: 255 253 248; /* 手册区更白，与主区分层 */
+  --console: 245 243 237; /* 暖白控制台 */
+  --panel: 255 255 255;
+  --rule: 219 214 202;
+  --ink: 26 23 18;
+  --dim: 110 106 96;
+  --signal: 77 124 15; /* 深柠檬绿，保证浅底对比度 */
+  --warn: 180 83 9;
+  --fault: 220 38 38;
+  --paper-ink: 26 23 18;
+  --paper-dim: 114 106 90;
+  --paper-rule: 216 209 194;
+  --ev-token: 110 106 96;
+  --ev-tool: 29 78 216;
+  --ev-result: 77 124 15;
+  --ev-error: 220 38 38;
+  --ev-compact: 124 58 237;
+  --ev-sidechain: 180 83 9;
+  --ev-done: 110 106 96;
 }
 
 html,
@@ -16,36 +62,43 @@ body,
 }
 
 body {
-  background: #0e1013;
-  color: #e8e4da;
+  background: rgb(var(--console));
+  color: rgb(var(--ink));
   font-family: "Inter", system-ui, -apple-system, "Segoe UI", "PingFang SC",
     "Microsoft YaHei", sans-serif;
   -webkit-font-smoothing: antialiased;
 }
 
-/* 细滚动条：深底 */
+/* 键盘可达：统一的 focus-visible 焦点环（鼠标点击不出现） */
+:focus-visible {
+  outline: 2px solid rgb(var(--signal));
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* 细滚动条：跟随主题 */
 .scroll-dark {
   scrollbar-width: thin;
-  scrollbar-color: #232630 transparent;
+  scrollbar-color: rgb(var(--rule)) transparent;
 }
 .scroll-dark::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
 .scroll-dark::-webkit-scrollbar-thumb {
-  background: #232630;
+  background: rgb(var(--rule));
   border-radius: 4px;
 }
 /* 纸色区滚动条 */
 .scroll-paper {
   scrollbar-width: thin;
-  scrollbar-color: #d8d1c2 transparent;
+  scrollbar-color: rgb(var(--paper-rule)) transparent;
 }
 .scroll-paper::-webkit-scrollbar {
   width: 8px;
 }
 .scroll-paper::-webkit-scrollbar-thumb {
-  background: #d8d1c2;
+  background: rgb(var(--paper-rule));
   border-radius: 4px;
 }
 
@@ -53,8 +106,8 @@ body {
 .hatch {
   background-image: repeating-linear-gradient(
     45deg,
-    rgba(176, 140, 255, 0.18),
-    rgba(176, 140, 255, 0.18) 4px,
+    rgb(var(--ev-compact) / 0.18),
+    rgb(var(--ev-compact) / 0.18) 4px,
     transparent 4px,
     transparent 8px
   );

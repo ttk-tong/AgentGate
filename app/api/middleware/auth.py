@@ -18,13 +18,14 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.domain.errors import RateLimited, Unauthorized
+from app.domain.errors import Forbidden, RateLimited, Unauthorized
 from app.domain.principal import Principal
 from app.persistence.db import get_db
 from app.persistence.redis_client import get_redis
 from app.resilience.rate_limit import RateLimiter, TenantQuota
 from app.resilience.redis_stores import RedisRateStore
 from app.security.auth import AuthService
+from app.security.authz import scope_allows
 from app.security.store import DbKeyStore
 
 # dev 匿名租户：auth_required=False 且无凭证时，归到一个固定租户，便于本地调试。
@@ -62,6 +63,19 @@ async def require_principal(
         f"Bearer {credentials.credentials}", now=datetime.now(UTC)
     )
     request.state.principal = principal
+    return principal
+
+
+async def require_admin(
+    principal: Principal = Depends(require_principal),
+) -> Principal:
+    """管理接口守卫：要求 admin:* scope（发/吊 key、建租户等特权操作）。
+
+    只有平台运营方的 admin key 能过。普通租户 key（sessions:* 等）一律 403，
+    杜绝租户自助发 key 提权。dev 匿名 Principal 自带 admin:*，本地照常可调。
+    """
+    if not scope_allows(principal.scopes, "admin:*"):
+        raise Forbidden("admin scope required")
     return principal
 
 

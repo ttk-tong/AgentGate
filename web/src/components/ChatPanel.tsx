@@ -1,9 +1,20 @@
+import { useEffect, useRef } from "react";
 import type { ChatMessage, ToolCallView } from "../types";
 
-// 聊天主区：用户/助手气泡 + 助手回合里的工具调用卡片。
 export function ChatPanel({ messages }: { messages: ChatMessage[] }) {
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [messages.length]);
+
   return (
-    <div className="scroll-dark flex flex-1 flex-col gap-4 overflow-y-auto p-4">
+    <div
+      role="log"
+      aria-live="polite"
+      aria-label="对话记录"
+      className="scroll-dark flex flex-1 flex-col gap-4 overflow-y-auto p-4"
+    >
       {messages.length === 0 && (
         <div className="m-auto max-w-sm text-center">
           <div className="font-mono text-meta uppercase text-dim">idle</div>
@@ -16,6 +27,7 @@ export function ChatPanel({ messages }: { messages: ChatMessage[] }) {
       {messages.map((m) => (
         <MessageBubble key={m.id} msg={m} />
       ))}
+      <div ref={bottomRef} />
     </div>
   );
 }
@@ -23,26 +35,41 @@ export function ChatPanel({ messages }: { messages: ChatMessage[] }) {
 function MessageBubble({ msg }: { msg: ChatMessage }) {
   const isUser = msg.role === "user";
   return (
-    <div className={`flex ${isUser ? "justify-end" : "justify-start"} animate-fadeUp`}>
+    <div
+      className={`flex ${isUser ? "justify-end" : "justify-start"} animate-fadeUp`}
+    >
       <div
         className={`max-w-[80%] rounded-lg px-4 py-2.5 ${
           isUser
             ? "bg-signal/15 text-ink ring-1 ring-signal/30"
-            : "bg-panel text-ink ring-1 ring-rule"
+            : msg.interrupted
+              ? "bg-panel text-ink ring-1 ring-fault/40"
+              : "bg-panel text-ink ring-1 ring-rule"
         }`}
       >
         <div className="mb-1 font-mono text-meta uppercase text-dim">
           {isUser ? "you" : "agent"}
         </div>
+
         {msg.text && (
           <div className="whitespace-pre-wrap break-words text-sm leading-relaxed">
             {msg.text}
           </div>
         )}
+
         {msg.streaming && !msg.text && (
           <div className="flex items-center gap-1.5 text-sm text-dim">
-            <span className="h-1.5 w-1.5 animate-pulseSignal rounded-full bg-signal" />
+            <span
+              aria-hidden="true"
+              className="h-1.5 w-1.5 animate-pulseSignal rounded-full bg-signal"
+            />
             思考中
+          </div>
+        )}
+
+        {msg.interrupted && (
+          <div className="mt-1.5 font-mono text-meta text-fault/80">
+            ⚠ 连接中断，内容可能不完整
           </div>
         )}
 
@@ -72,7 +99,9 @@ function ToolCard({ tc }: { tc: ToolCallView }) {
   return (
     <div className={`mt-2 rounded-md border ${border} bg-console/80 p-2`}>
       <div className="flex items-center gap-2 font-mono text-xs">
-        <span className="font-semibold text-ev-tool">⌁ {tc.name}</span>
+        <span className="font-semibold text-ev-tool" aria-label={`工具调用：${tc.name}`}>
+          ⌁ {tc.name}
+        </span>
         <span className="text-dim">
           {pending ? "running…" : tc.ok ? "✓ ok" : "✗ failed"}
         </span>

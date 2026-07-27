@@ -49,8 +49,16 @@ class Event(BaseModel):
         )
 
     @staticmethod
-    def error(message: str, retryable: bool, seq: int) -> "Event":
-        return Event(type="error", data={"message": message, "retryable": retryable}, seq=seq)
+    def error(
+        message: str, retryable: bool, seq: int, code: str = "internal_error"
+    ) -> "Event":
+        """流内错误帧。code/message 与 HTTP 错误协议对齐（api.errors），
+        trace_id 由 SSE 序列化层注入，保证流内/流外错误都能追踪到日志。"""
+        return Event(
+            type="error",
+            data={"message": message, "retryable": retryable, "code": code},
+            seq=seq,
+        )
 
     @staticmethod
     def tool_call(tool_call_id: str, name: str, arguments: dict, seq: int) -> "Event":
@@ -62,7 +70,7 @@ class Event(BaseModel):
 
     @staticmethod
     def tool_result(
-        tool_call_id: str, name: str, ok: bool, display, seq: int
+        tool_call_id: str, name: str, ok: bool, display: object, seq: int
     ) -> "Event":
         return Event(
             type="tool_result",

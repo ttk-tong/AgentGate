@@ -39,14 +39,23 @@ jobs:
           pip install -e ".[dev]" ruff mypy
       - name: Lint (ruff)
         run: ruff check app tests
-      - name: Type check (mypy)
+      - name: Type check (mypy, core is a hard gate)
+        # core 模块（domain + config）严格检查，失败即 CI 失败——不再 `|| true`。
+        run: mypy app/domain app/config.py
+      - name: Type check (mypy, full scan advisory)
+        # 全量扫描仍带全局基线检查（check_untyped_defs 等），暂只告警，逐步收紧。
         run: mypy app || true
       - name: Alembic migration check
         run: |
           alembic upgrade head
           alembic check
-      - name: Tests
-        run: pytest -q --maxfail=1
+      - name: Tests (with coverage)
+        run: pytest -q --maxfail=1 --cov=app --cov-report=term-missing --cov-report=xml
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
 
   frontend:
     runs-on: ubuntu-latest

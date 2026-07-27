@@ -1,6 +1,14 @@
 // 与后端 app/domain/events.py 的 Event 协议对齐。
 // SSE 帧格式：`event: <type>\ndata: <json>\n\n`（见 chat.py 的 _sse）。
 
+export interface Kpi {
+  sessions: number;
+  events: number;
+  tools: number;
+  turns: number;
+  tokens: number;
+}
+
 export type EventType =
   | "token"
   | "tool_call"
@@ -36,6 +44,8 @@ export interface ChatMessage {
   // 该助手回合里触发的工具调用（按 tool_call_id 聚合，保持发生顺序）
   toolCalls: ToolCallView[];
   streaming?: boolean;
+  // 流中途断开（网络问题），文本可能不完整
+  interrupted?: boolean;
   stopReason?: string;
   usage?: { input_tokens?: number; output_tokens?: number };
 }
@@ -46,4 +56,17 @@ export interface PendingConfirmation {
   name: string;
   arguments: Record<string, unknown>;
   reason: string | null;
+}
+
+// 事件轨道里的一条记录：SSE 事件 + 到达时间 + 所属回合（第几次用户发送）
+export interface LoggedEvent extends AgentEvent {
+  ts: number;
+  turn: number;
+}
+
+// 流连接状态：ok 正常；lost 表示上一条消息的流中途断开（可一键重发）
+export interface ConnectionState {
+  status: "ok" | "lost";
+  /** 断流时未完成的那条用户输入，用于一键重发 */
+  lastInput?: string;
 }

@@ -1,3 +1,5 @@
+import type { ReactNode } from "react";
+
 // 右侧「手册」：纸色底，打破全深色默认。面向访客解释项目是什么、
 // 架构长什么样、能试哪些 demo、技术栈。示例 prompt 点击即填 composer。
 
@@ -164,7 +166,7 @@ function Section({
 }: {
   eyebrow: string;
   title: string;
-  children: React.ReactNode;
+  children: ReactNode;
 }) {
   return (
     <section>

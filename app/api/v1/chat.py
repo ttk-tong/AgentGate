@@ -9,11 +9,12 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,20 +28,28 @@ from app.context.session_store import SessionStore
 from app.domain.events import Event
 from app.domain.llm import ToolCall
 from app.domain.principal import Principal
+from app.observability.logging import get_logger, get_trace_id
 from app.orchestration.agent_loop import AgentLoop, ConfirmationPending
 from app.orchestration.prompt.assembler import PromptAssembler
 from app.orchestration.prompt.composer import PromptComposer
+from app.orchestration.run_stream import (
+    RunEventStream,
+    new_run_id,
+    parse_last_event_id,
+)
 from app.orchestration.session_lock import SessionBusyError, session_lock
 from app.orchestration.skills.registry import SkillRegistry
 from app.orchestration.subagent import SubagentRunner
 from app.orchestration.tools import attach_spawn_agent, build_default_registry
-from app.persistence.db import get_db
+from app.persistence.db import get_db, get_sessionmaker
 from app.persistence.redis_client import get_redis
 from app.routing.factory import get_provider
 from app.routing.model_router import Capability, ModelRouter
 from app.resilience.circuit_breaker import CircuitBreaker
 from app.resilience.redis_stores import RedisCircuitStore
 from app.security.authz import authorize
+
+log = get_logger("api.chat")
 
 # 技能注册表：进程内单例，首次用时按 settings.skills_dir 扫描 SKILL.md（plan/07 §4）。
 _SKILL_REGISTRY: SkillRegistry | None = None
@@ -59,11 +68,14 @@ def _pending_key(session_id: uuid.UUID) -> str:
 
 
 class CreateSessionRequest(BaseModel):
+    # 客户内部的终端用户标识（B2B 模型 A）：仅用于会话归属/记忆隔离/审计，
+    # 不参与鉴权——租户隔离由 tenant_id 硬校验保证。
     external_user: str | None = None
 
 
 class CreateSessionResponse(BaseModel):
     session_id: uuid.UUID
+    external_user: str | None = None
 
 
 class MessageRequest(BaseModel):
@@ -96,7 +108,7 @@ async def create_session(
     sid = await store.create_session(
         external_user=body.external_user, tenant_id=principal.tenant_id
     )
-    return CreateSessionResponse(session_id=sid)
+    return CreateSessionResponse(session_id=sid, external_user=body.external_user)
 
 
 def _get_skill_registry() -> SkillRegistry | None:
@@ -280,25 +292,118 @@ async def post_message_stream(
     redis: Redis = Depends(get_redis),
     principal: Principal = Depends(enforce_rate_limit),
 ) -> StreamingResponse:
-    """SSE 流式：每个 Loop Event 作为一个 SSE 事件推给客户端。"""
-    await _ensure_session(db, session_id, principal, "sessions:write")
-    loop = await _build_loop(db, session_id, redis)
+    """SSE 流式：运行放后台任务执行并 tee 进 Redis 缓冲，响应端跟读缓冲。
 
-    async def event_gen() -> AsyncIterator[str]:
+    每帧带 `id: {run_id}:{seq}`（SSE 原生 Last-Event-ID 机制）。客户端断线
+    不会中止运行——后台任务继续写缓冲，重连走 GET 同路径从断点续读。
+    """
+    await _ensure_session(db, session_id, principal, "sessions:write")
+
+    run_id = new_run_id()
+    _spawn_run(session_id, body.content, run_id)
+    stream = RunEventStream(redis)
+    return _stream_response(stream, session_id, run_id, after_seq=0)
+
+
+@router.get("/sessions/{session_id}/messages/stream")
+async def resume_message_stream(
+    session_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+    principal: Principal = Depends(enforce_rate_limit),
+    last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    last_event_id_q: str | None = Query(default=None, alias="last_event_id"),
+) -> StreamingResponse:
+    """SSE 断线续传：按 Last-Event-ID（`{run_id}:{seq}`）从断点重放并跟读。
+
+    也接受查询参数 last_event_id（原生 EventSource 重连只带请求头，
+    手动 fetch 重连用查询参数更方便）。不带 ID 时从会话最近一次运行的
+    开头重放。运行缓冲保留 1 小时（run_stream.STREAM_TTL_S）。
+    """
+    await _ensure_session(db, session_id, principal, "sessions:read")
+    stream = RunEventStream(redis)
+
+    parsed = parse_last_event_id(last_event_id or last_event_id_q)
+    if parsed is not None:
+        run_id, after_seq = parsed
+    else:
+        current = await stream.get_current(session_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="no resumable run for session")
+        run_id, after_seq = current, 0
+
+    if not await stream.exists(session_id, run_id):
+        raise HTTPException(status_code=404, detail="run buffer not found or expired")
+
+    return _stream_response(stream, session_id, run_id, after_seq=after_seq)
+
+
+# 后台运行任务的强引用集合（防止被 GC 提前回收）
+_RUN_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn_run(session_id: uuid.UUID, content: str, run_id: str) -> None:
+    task = asyncio.create_task(_run_to_stream(session_id, content, run_id))
+    _RUN_TASKS.add(task)
+    task.add_done_callback(_RUN_TASKS.discard)
+
+
+async def _run_to_stream(session_id: uuid.UUID, content: str, run_id: str) -> None:
+    """后台执行一次运行，把每个 Event tee 进 Redis 运行缓冲。
+
+    与 HTTP 连接生命周期解耦：客户端断开只影响读端，运行照常完成并落库。
+    自带 DB 会话（请求作用域的 db 随响应结束关闭，不能带进后台任务）。
+    """
+    redis = get_redis()
+    stream = RunEventStream(redis)
+    last_seq = 0
+
+    async def _publish(ev: Event) -> None:
+        nonlocal last_seq
+        if ev.type == "error":  # 流内错误与 HTTP 错误协议对齐：都可拿 trace_id 追日志
+            ev.data.setdefault("trace_id", get_trace_id() or "-")
+        last_seq = max(last_seq, ev.seq)
+        await stream.publish(session_id, run_id, ev)
+
+    try:
+        async with get_sessionmaker()() as db:
+            try:
+                async with session_lock(redis, session_id):
+                    await stream.mark_current(session_id, run_id)
+                    loop = await _build_loop(db, session_id, redis)
+                    try:
+                        async for ev in loop.run(session_id, content):
+                            if ev.type == "done":
+                                await db.commit()  # 先落库再发终止帧：读端见 done 时数据已可见
+                            await _publish(ev)
+                        await db.commit()
+                    except ConfirmationPending as e:
+                        # tool_confirmation 事件已发；存盘待执行调用并显式收尾
+                        await _save_pending(redis, session_id, e.calls)
+                        await db.commit()
+                        await stream.publish_end(session_id, run_id, last_seq)
+            except SessionBusyError:
+                await _publish(
+                    Event.error("session is busy", retryable=True, seq=1, code="session_busy")
+                )
+    except Exception as e:  # noqa: BLE001  兜底：任何未预期错误都要给读端一个终止帧
+        log.error("stream_run_failed", session_id=str(session_id), run_id=run_id, error=str(e))
         try:
-            async with session_lock(redis, session_id):
-                try:
-                    async for ev in loop.run(session_id, body.content):
-                        if ev.type == "done":
-                            await db.commit()
-                        yield _sse(ev)
-                except ConfirmationPending as e:
-                    # tool_confirmation 事件已在 Loop 内产出；此处存盘待执行调用
-                    await _save_pending(redis, session_id, e.calls)
-                    await db.commit()
-        except SessionBusyError:
-            busy = Event.error("session is busy", retryable=True, seq=0)
-            yield _sse(busy)
+            await _publish(
+                Event.error("run failed", retryable=False, seq=last_seq + 1, code="internal_error")
+            )
+        except Exception:  # noqa: BLE001  Redis 也不可用时只能靠读端 idle 超时收尾
+            pass
+
+
+def _stream_response(
+    stream: RunEventStream, session_id: uuid.UUID, run_id: str, *, after_seq: int
+) -> StreamingResponse:
+    async def event_gen() -> AsyncIterator[str]:
+        async for seq, ev_type, payload in stream.read(
+            session_id, run_id, after_seq=after_seq
+        ):
+            yield f"id: {run_id}:{seq}\nevent: {ev_type}\ndata: {payload}\n\n"
 
     return StreamingResponse(
         event_gen(),
@@ -348,7 +453,3 @@ async def post_confirmation(
         await redis.delete(_pending_key(session_id))
 
     return MessageResponse(session_id=session_id, **agg)
-
-
-def _sse(ev: Event) -> str:
-    return f"event: {ev.type}\ndata: {json.dumps(ev.model_dump(), ensure_ascii=False)}\n\n"

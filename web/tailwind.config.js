@@ -1,33 +1,39 @@
 /** @type {import('tailwindcss').Config} */
+
+// 所有语义色走 CSS 变量（RGB 三元组，见 index.css），
+// 深/浅色只切换变量值，组件类名不变。`<alpha-value>` 保住 bg-signal/15 这类透明度写法。
+const v = (name) => `rgb(var(--${name}) / <alpha-value>)`;
+
 export default {
   content: ["./index.html", "./src/**/*.{ts,tsx}"],
+  darkMode: ["selector", '[data-theme="dark"]'],
   theme: {
     extend: {
       colors: {
-        // —— 双底基调：深色控制台 + 纸色手册 ——
-        paper: "#F1EDE4", // 右侧手册背景，打破全深色默认
-        console: "#0E1013", // 控制台深底（略暖棕黑）
-        panel: "#14171C", // 控制台内层卡片
-        rule: "#232630", // 分割线 / border
-        ink: "#E8E4DA", // 深底上的主文字
-        dim: "#7A7B82", // 次文字
+        // —— 双底基调：控制台 + 纸色手册 ——
+        paper: v("paper"),
+        console: v("console"),
+        panel: v("panel"),
+        rule: v("rule"),
+        ink: v("ink"),
+        dim: v("dim"),
         // —— 信号色：事件在流动 ——
-        signal: "#B8FF3D", // 荧光柠檬绿，主 accent
-        warn: "#FFB454", // 琥珀：子 agent / 需确认
-        fault: "#FF5D62", // 错误
+        signal: v("signal"),
+        warn: v("warn"),
+        fault: v("fault"),
         // 纸色区文字
-        "paper-ink": "#1A1712",
-        "paper-dim": "#726A5A",
-        "paper-rule": "#D8D1C2",
+        "paper-ink": v("paper-ink"),
+        "paper-dim": v("paper-dim"),
+        "paper-rule": v("paper-rule"),
         // 事件类型配色（timeline / eventlog 复用）
         ev: {
-          token: "#7A7B82",
-          tool: "#5B9CFF",
-          result: "#B8FF3D",
-          error: "#FF5D62",
-          compact: "#B08CFF",
-          sidechain: "#FFB454",
-          done: "#7A7B82",
+          token: v("ev-token"),
+          tool: v("ev-tool"),
+          result: v("ev-result"),
+          error: v("ev-error"),
+          compact: v("ev-compact"),
+          sidechain: v("ev-sidechain"),
+          done: v("ev-done"),
         },
       },
       fontFamily: {
