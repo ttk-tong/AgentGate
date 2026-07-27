@@ -72,11 +72,11 @@ flowchart TB
 ## 快速开始（Docker 一键起）
 
 ```bash
-git clone <repo> && cd AgentGate
+git clone https://github.com/ttk-tong/AgentGate.git && cd AgentGate
 docker compose up -d --build
 ```
 
-起来的服务：
+启动服务列表：
 
 | 服务 | 地址 | 说明 |
 |---|---|---|
@@ -113,20 +113,11 @@ curl -s -X POST localhost:8000/v1/sessions/$SID/messages \
 
 ### 认证与多租户（生产形态：B2B 每客户一套 key）
 
-**隔离模型**：一个企业客户 = 一个 **租户（tenant）**，给它签发一把（或多把可轮转的）
-API Key。客户后端持有 key，代自己的终端用户调用；终端用户标识放进 `external_user`，
-仅用于会话归属 / 记忆隔离 / 审计，**不参与鉴权**——租户隔离由 `tenant_id` 硬校验保证，
-session_id 泄露也调不动别的租户的会话。
+**隔离模型**：一个企业客户 = 一个 **租户（tenant）**，给它签发一把（或多把可轮转的）API Key。客户后端持有 key，代自己的终端用户调用；终端用户标识放进 `external_user`，仅用于会话归属 / 记忆隔离 / 审计，**不参与鉴权**——租户隔离由 `tenant_id` 硬校验保证，session_id 泄露也调不动别的租户的会话。
 
-> **隔离边界是租户，不是 key，也不是 `external_user`。** 跨租户一律拒绝（硬保证）；
-> 但**同一租户内**的多把 key、不同 `external_user` 之间**不互相隔离**——session_id
-> 若泄露给同租户的另一把有 `sessions:*` 权限的 key，是可以访问的。这符合 B2B 场景
-> （key 由客户后端持有，租户内会话本就归该客户统一管理）。若需要「同一客户下不同
-> 终端用户彼此的会话互不可见」，需引入 user 级隔离（user 表 + `user_id` 贯穿鉴权）。
+> **隔离边界是租户，不是 key，也不是 `external_user`。** 跨租户一律拒绝（硬保证）；但**同一租户内**的多把 key、不同 `external_user` 之间**不互相隔离**——session_id，若泄露给同租户的另一把有 `sessions:*` 权限的 key，是可以访问的。这符合 B2B 场景（key 由客户后端持有，租户内会话本就归该客户统一管理）。
 
-dev 默认 `AUTH_REQUIRED=false` 匿名放行（所有人归一个匿名租户，仅供本地调试）。
-compose 里 app 服务已默认 `AUTH_REQUIRED=true`，即生产形态；临时敞开用
-`AUTH_REQUIRED=false docker compose up -d app`。
+dev 默认 `AUTH_REQUIRED=false` 匿名放行（所有人归一个匿名租户，仅供本地调试）。compose 里 app 服务已默认 `AUTH_REQUIRED=true`，即生产形态；临时敞开用`AUTH_REQUIRED=false docker compose up -d app`。
 
 **管理接口**（`/v1/admin/*`，全部要求 `admin:*` scope，禁止签发特权 key，杜绝租户自助提权）：
 
@@ -164,18 +155,13 @@ curl -s -X DELETE localhost:8000/v1/admin/tenants/$TID/keys/<旧KID> \
   -H "Authorization: Bearer $ADMIN"
 ```
 
-密钥安全设计：`ak_<prefix>_<secret>` 格式，服务端只存 `sha256(salt+secret)` 哈希 + 明文
-prefix；验证走常量时间比对；跨租户访问硬校验拒绝；吊销/过期即时生效。超限返回
-`429 + Retry-After`（令牌桶精确计算补足时间）。生产务必把 `AUTH_SALT` 换成强随机保密值
-（改盐会使所有旧 key 失效）。
+密钥安全设计：`ak_<prefix>_<secret>` 格式，服务端只存 `sha256(salt+secret)` 哈希 + 明文prefix；验证走常量时间比对；跨租户访问硬校验拒绝；吊销/过期即时生效。超限返回`429 + Retry-After`（令牌桶精确计算补足时间）。
 
 ### 前端控制台（可选）
 
 ```bash
 cd web && npm install && npm run dev   # http://localhost:3000
 ```
-
-三栏布局：实时对话（SSE 流式 + 工具调用卡片 + 危险工具确认弹窗）｜事件轨道（token/tool/usage 全事件流）｜示例手册。
 
 ### 本地开发（不走 Docker）
 
@@ -298,14 +284,6 @@ tests/              # 离线单测 + 端到端
 - **sidechain 语义**：子过程标记事件不改父 head，投影自动跳过——中间过程不污染父 LLM 上下文，但保留审计。
 
 </details>
-
-## Roadmap
-
-- OpenTelemetry traces（Agent Loop 状态机打 span）
-- SSE 断线续传（`Last-Event-ID` 从事件 DAG 重放）
-- 限流层显式 fail-open 降级分支 + 告警打点
-- 流式请求推流前提前释放 DB 连接
-- 记忆异步抽取/衰减 handler 真实逻辑填充
 
 ## License
 
