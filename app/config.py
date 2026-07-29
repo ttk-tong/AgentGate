@@ -70,6 +70,12 @@ class Settings(BaseSettings):
     memory_enabled: bool = True
     # 技能目录（扫描 SKILL.md）；留空则不加载任何技能。
     skills_dir: str = ""
+    # —— MCP（外部工具接入，见 app/mcp）——
+    # MCP server 接入配置：一段 JSON 数组，格式见 app/mcp/config.py 的模块文档。
+    # 留空则整个 MCP 子系统不启用（默认路径，零开销）。
+    # 注意 readonly_tools 是唯一能让 MCP 工具进入并发批的开关——并发执行第三方
+    # 写操作的后果由部署方承担，所以必须显式声明，不从 server 的 hint 推断。
+    mcp_servers: str = ""
     # Agent 身份（提示词 identity 块）。
     agent_name: str = "AgentGate"
     agent_role: str = "一个有帮助的 AI 助手"

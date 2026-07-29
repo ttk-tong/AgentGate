@@ -38,7 +38,17 @@ async def lifespan(app: FastAPI):
             # log.info("auto_migrate.done")
         except Exception as e:  # noqa: BLE001
             log.warning("auto_migrate.failed", error=str(e))
+    # MCP：进程级常驻连接（stdio server 是子进程，握手要几百毫秒到几秒，
+    # 不能每请求拉一遍）。未配置 MCP_SERVERS 则整个子系统不启用。
+    # 单台 server 起不来只隔离它自己，不阻断网关启动（见 app/mcp/manager.py）。
+    from app.mcp.manager import setup_mcp, shutdown_mcp
+
+    try:
+        await setup_mcp(settings.mcp_servers)
+    except Exception as e:  # noqa: BLE001  MCP 是可选增强，起不来不该拦住服务
+        log.warning("mcp_setup_failed", error=str(e))
     yield
+    await shutdown_mcp()  # 回收 MCP 子进程/连接，避免容器里留僵尸进程
     await dispose_engine()
     await close_redis()
     # log.info("shutdown")

@@ -85,6 +85,7 @@ class AgentLoop:
         external_user: str | None = None,
         tenant_id: str | None = None,
         circuit=None,
+        granted_scopes: list[str] | None = None,
     ):
         self.store = store
         self.provider = provider
@@ -108,6 +109,20 @@ class AgentLoop:
         self.external_user = external_user
         self.tenant_id = tenant_id
         self.circuit = circuit
+        # 本次运行主体的 scope（来自 Principal）。工具层据此做权限判定——
+        # MCP 工具要求 mcp:{server}（见 app/mcp/proxy_tool）。空列表表示
+        # 「未注入」，工具层不二次设卡（dev 匿名调用与内部路径沿用此约定）。
+        self.granted_scopes = list(granted_scopes or [])
+
+    def _tool_context(self, session_id) -> ToolContext:
+        """构造工具执行上下文。集中一处，避免多个调用点漏传 scope。"""
+        return ToolContext(
+            tenant_id=self.tenant_id or "",
+            session_id=str(session_id),
+            agent_id=self.model,
+            trace_id=get_trace_id() or "",
+            granted_scopes=self.granted_scopes,
+        )
 
     def _tools_schema(self) -> list[dict]:
         if self.registry is None:
@@ -244,7 +259,7 @@ class AgentLoop:
                 )
 
         if to_run:
-            ctx = ToolContext(session_id=str(session_id), agent_id=self.model)
+            ctx = self._tool_context(session_id)
             run_results = await execute_batched(
                 to_run,
                 self.registry,
@@ -496,7 +511,7 @@ class AgentLoop:
                 seq += 1
                 yield Event.tool_call(tc.id, tc.name, tc.arguments, seq)
 
-            ctx = ToolContext(session_id=str(session_id), agent_id=self.model)
+            ctx = self._tool_context(session_id)
             tool_span = start_span(
                 tracer, "agent.tool_exec", parent=run_span,
                 attributes={

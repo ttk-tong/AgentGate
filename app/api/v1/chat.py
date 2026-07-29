@@ -28,6 +28,7 @@ from app.context.session_store import SessionStore
 from app.domain.events import Event
 from app.domain.llm import ToolCall
 from app.domain.principal import Principal
+from app.mcp.manager import get_mcp_manager
 from app.observability.logging import get_logger, get_trace_id
 from app.orchestration.agent_loop import AgentLoop, ConfirmationPending
 from app.orchestration.prompt.assembler import PromptAssembler
@@ -43,10 +44,10 @@ from app.orchestration.subagent import SubagentRunner
 from app.orchestration.tools import attach_spawn_agent, build_default_registry
 from app.persistence.db import get_db, get_sessionmaker
 from app.persistence.redis_client import get_redis
-from app.routing.factory import get_provider
-from app.routing.model_router import Capability, ModelRouter
 from app.resilience.circuit_breaker import CircuitBreaker
 from app.resilience.redis_stores import RedisCircuitStore
+from app.routing.factory import get_provider
+from app.routing.model_router import Capability, ModelRouter
 from app.security.authz import authorize
 
 log = get_logger("api.chat")
@@ -123,25 +124,53 @@ def _get_skill_registry() -> SkillRegistry | None:
     if not settings.skills_dir:
         return None
     reg = SkillRegistry()
-    known = set(build_default_registry().names())
-    reg.load_dir(settings.skills_dir, known_tools=known)
+    # 已知工具集要含 MCP 工具，否则引用了 MCP 工具的技能会被判为「引用不存在的工具」而拒载
+    probe = build_default_registry()
+    _attach_mcp_tools(probe)
+    reg.load_dir(settings.skills_dir, known_tools=set(probe.names()))
     _SKILL_REGISTRY = reg
     return reg
 
 
+def _attach_mcp_tools(registry) -> list[str]:
+    """把常驻 MCP manager 的工具挂进本请求的注册表。未启用 MCP 则空操作。
+
+    调用时机很关键：必须在本地工具注册**之后**——manager 对撞名的处理是跳过并
+    告警，先注册的赢，所以本地工具优先，外部 server 无法用同名工具顶掉 file_read。
+    """
+    manager = get_mcp_manager()
+    if manager is None:
+        return []
+    attached = manager.attach_to_registry(registry)
+    if attached:
+        log.debug("mcp.tools_attached", count=len(attached))
+    return attached
+
+
 async def _build_loop(
-    db: AsyncSession, session_id: uuid.UUID | None = None, redis: Redis | None = None
+    db: AsyncSession,
+    session_id: uuid.UUID | None = None,
+    redis: Redis | None = None,
+    *,
+    granted_scopes: list[str] | None = None,
 ) -> AgentLoop:
     """装配 Agent Loop。阶段 6：按配置挂上记忆服务 + 提示词分层组装器。
 
     session_id 给定时读取会话的 external_user / tenant_id，供记忆召回的 scope
     隔离与 remember 写入定位（匿名会话则不召回/不写用户级记忆）。
+
+    granted_scopes 是请求主体的 scope（Principal.scopes），透传给工具层做权限
+    判定——MCP 工具要求 mcp:{server}（见 app/mcp/proxy_tool）。
     """
     settings = get_settings()
     store = SessionStore(db)
     # 降级链：逗号分隔的模型名，过载时按序切换（plan/03 §5、02 §3.2）
     fallbacks = [m.strip() for m in settings.fallback_models.split(",") if m.strip()]
     registry = build_default_registry()
+    # MCP：把常驻 manager 里各 server 的工具作为代理挂进本请求的注册表。
+    # 代理很轻（共享常驻 client），但注册表是每请求新建的，所以每次都要挂。
+    # 本地工具先注册 → 撞名时本地优先（manager 内部跳过并告警，不静默覆盖）。
+    _attach_mcp_tools(registry)  # 返回的名单只用于日志，已在函数内部打点
     provider = get_provider()
     route = ModelRouter(getattr(provider, "name", "configured"), settings.default_model).resolve(
         Capability(tools=bool(registry.names())),
@@ -193,6 +222,7 @@ async def _build_loop(
         prompt_composer=composer,
         external_user=external_user,
         tenant_id=tenant_id,
+        granted_scopes=granted_scopes,
         circuit=CircuitBreaker(RedisCircuitStore(redis)) if redis is not None else None,
     )
 
@@ -231,7 +261,7 @@ async def post_message(
 ) -> MessageResponse:
     """非流式：内部消费 Loop 事件流，聚合成一次性响应。"""
     await _ensure_session(db, session_id, principal, "sessions:write")
-    loop = await _build_loop(db, session_id, redis)
+    loop = await _build_loop(db, session_id, redis, granted_scopes=principal.scopes)
 
     try:
         async with session_lock(redis, session_id):
@@ -300,7 +330,9 @@ async def post_message_stream(
     await _ensure_session(db, session_id, principal, "sessions:write")
 
     run_id = new_run_id()
-    _spawn_run(session_id, body.content, run_id)
+    # scope 随任务带进后台：后台自带 DB 会话、脱离请求作用域，principal 不会
+    # 自动传递，必须显式捕获——否则 MCP 工具的 scope 检查在流式路径下永远拿不到。
+    _spawn_run(session_id, body.content, run_id, granted_scopes=list(principal.scopes))
     stream = RunEventStream(redis)
     return _stream_response(stream, session_id, run_id, after_seq=0)
 
@@ -342,13 +374,19 @@ async def resume_message_stream(
 _RUN_TASKS: set[asyncio.Task] = set()
 
 
-def _spawn_run(session_id: uuid.UUID, content: str, run_id: str) -> None:
-    task = asyncio.create_task(_run_to_stream(session_id, content, run_id))
+def _spawn_run(
+    session_id: uuid.UUID, content: str, run_id: str, granted_scopes: list[str]
+) -> None:
+    task = asyncio.create_task(
+        _run_to_stream(session_id, content, run_id, granted_scopes)
+    )
     _RUN_TASKS.add(task)
     task.add_done_callback(_RUN_TASKS.discard)
 
 
-async def _run_to_stream(session_id: uuid.UUID, content: str, run_id: str) -> None:
+async def _run_to_stream(
+    session_id: uuid.UUID, content: str, run_id: str, granted_scopes: list[str]
+) -> None:
     """后台执行一次运行，把每个 Event tee 进 Redis 运行缓冲。
 
     与 HTTP 连接生命周期解耦：客户端断开只影响读端，运行照常完成并落库。
@@ -370,7 +408,9 @@ async def _run_to_stream(session_id: uuid.UUID, content: str, run_id: str) -> No
             try:
                 async with session_lock(redis, session_id):
                     await stream.mark_current(session_id, run_id)
-                    loop = await _build_loop(db, session_id, redis)
+                    loop = await _build_loop(
+                        db, session_id, redis, granted_scopes=granted_scopes
+                    )
                     try:
                         async for ev in loop.run(session_id, content):
                             if ev.type == "done":
@@ -434,7 +474,7 @@ async def post_confirmation(
 
     approved = {body.tool_call_id} if body.approved else set()
     rejected = set() if body.approved else {body.tool_call_id}
-    loop = await _build_loop(db, session_id, redis)
+    loop = await _build_loop(db, session_id, redis, granted_scopes=list(principal.scopes))
 
     try:
         async with session_lock(redis, session_id):

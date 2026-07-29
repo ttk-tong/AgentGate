@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import UTC, datetime
 
@@ -25,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.middleware.auth import require_admin
 from app.config import get_settings
 from app.domain.principal import Principal
+from app.mcp.manager import get_mcp_manager
 from app.observability.logging import get_logger
 from app.persistence.db import get_db
 from app.persistence.tables import ApiKeyRow, TenantRow
@@ -44,6 +46,17 @@ _ALLOWED_KEY_SCOPES = {
     "tasks:write",
     "tasks:*",
 }
+
+# MCP server 的 scope 不能写死在上面的集合里——server 名字来自部署配置
+# （MCP_SERVERS），是动态的。所以按 `mcp:<name>` / `mcp:*` 的形状放行，
+# 名字用与工具名一致的安全字符集校验，避免把任意字符串塞进 scope。
+# 没有这条，AUTH_REQUIRED=true 时任何租户 key 都拿不到 mcp:* scope，
+# MCP 工具会在权限阶段全被拒（见 app/mcp/proxy_tool.check_permissions）。
+_MCP_SCOPE_RE = re.compile(r"^mcp:(\*|[A-Za-z0-9_-]{1,64})$")
+
+
+def _scope_allowed_for_key(scope: str) -> bool:
+    return scope in _ALLOWED_KEY_SCOPES or bool(_MCP_SCOPE_RE.match(scope))
 
 
 # —— 请求/响应模型 ——
@@ -106,7 +119,7 @@ def _validate_scopes(scopes: list[str]) -> list[str]:
     cleaned = [s.strip() for s in scopes if s.strip()]
     if not cleaned:
         raise HTTPException(status_code=422, detail="scopes must not be empty")
-    bad = [s for s in cleaned if s not in _ALLOWED_KEY_SCOPES]
+    bad = [s for s in cleaned if not _scope_allowed_for_key(s)]
     if bad:
         raise HTTPException(
             status_code=422,
@@ -236,3 +249,24 @@ async def revoke_key(
         raise HTTPException(status_code=404, detail="active key not found")
     await db.commit()
     log.info("api_key_revoked", tenant_id=str(tenant_id), api_key_id=str(key_id))
+
+
+# —— MCP 运行状态 ——
+
+
+@router.get("/mcp")
+async def mcp_status(_admin: Principal = Depends(require_admin)) -> dict:
+    """MCP 各 server 的健康状态与每个工具的映射判定。
+
+    刻意放在 admin 下而不是 /readyz：MCP 是可选增强，一台外部 server 挂掉不该
+    让编排器被判为 not ready、被 k8s 重启或摘出负载均衡。这里回答的是运维问题
+    ——「哪台 server 掉了」、「为什么这个工具不并发」（decisions 里的 layer 字段）。
+    """
+    manager = get_mcp_manager()
+    if manager is None:
+        return {"enabled": False, "servers": [], "tools": []}
+    return {
+        "enabled": True,
+        "servers": manager.health_snapshot(),
+        "tools": manager.tool_decisions(),
+    }
