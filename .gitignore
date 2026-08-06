@@ -20,6 +20,8 @@ dist/
 .vscode/
 .DS_Store
 Thumbs.db
+# Claude Code 本地权限设置（每人一份，不入库；设计文档 .claude/plan/ 照常提交）
+.claude/settings.local.json
 
 # Logs
 *.log

@@ -29,11 +29,11 @@ class Event(BaseModel):
     seq: int = 0
 
     @staticmethod
-    def token(text: str, seq: int) -> "Event":
+    def token(text: str, seq: int) -> Event:
         return Event(type="token", data={"text": text}, seq=seq)
 
     @staticmethod
-    def usage(input_tokens: int, output_tokens: int, seq: int) -> "Event":
+    def usage(input_tokens: int, output_tokens: int, seq: int) -> Event:
         return Event(
             type="usage",
             data={"input_tokens": input_tokens, "output_tokens": output_tokens},
@@ -41,7 +41,7 @@ class Event(BaseModel):
         )
 
     @staticmethod
-    def done(stop_reason: str, head_event_id: str | None, usage: dict, seq: int) -> "Event":
+    def done(stop_reason: str, head_event_id: str | None, usage: dict, seq: int) -> Event:
         return Event(
             type="done",
             data={"stop_reason": stop_reason, "head_event_id": head_event_id, "usage": usage},
@@ -51,7 +51,7 @@ class Event(BaseModel):
     @staticmethod
     def error(
         message: str, retryable: bool, seq: int, code: str = "internal_error"
-    ) -> "Event":
+    ) -> Event:
         """流内错误帧。code/message 与 HTTP 错误协议对齐（api.errors），
         trace_id 由 SSE 序列化层注入，保证流内/流外错误都能追踪到日志。"""
         return Event(
@@ -61,7 +61,7 @@ class Event(BaseModel):
         )
 
     @staticmethod
-    def tool_call(tool_call_id: str, name: str, arguments: dict, seq: int) -> "Event":
+    def tool_call(tool_call_id: str, name: str, arguments: dict, seq: int) -> Event:
         return Event(
             type="tool_call",
             data={"tool_call_id": tool_call_id, "name": name, "arguments": arguments},
@@ -71,7 +71,7 @@ class Event(BaseModel):
     @staticmethod
     def tool_result(
         tool_call_id: str, name: str, ok: bool, display: object, seq: int
-    ) -> "Event":
+    ) -> Event:
         return Event(
             type="tool_result",
             data={"tool_call_id": tool_call_id, "name": name, "ok": ok, "display": display},
@@ -81,7 +81,7 @@ class Event(BaseModel):
     @staticmethod
     def tool_confirmation(
         tool_call_id: str, name: str, arguments: dict, reason: str | None, seq: int
-    ) -> "Event":
+    ) -> Event:
         return Event(
             type="tool_confirmation",
             data={
@@ -92,3 +92,15 @@ class Event(BaseModel):
             },
             seq=seq,
         )
+
+    @staticmethod
+    def subagent(seq: int, *, phase: str, **fields: Any) -> Event:
+        """子 agent 进展（plan/03 §6、12 §10.2）。
+
+        phase ∈ started | finished | failed | denied。字段随 phase 变化（started 带 task，
+        finished 带 usage/stop_reason/duration_ms，denied 带 reason），所以用 **fields 收
+        而不是写死签名——这条事件的消费方是前端与审计，加字段不该改协议函数。
+
+        没有这条事件时，父流里对一次 300 秒的 fan-out 只有一个 tool_result，客户端全程空白。
+        """
+        return Event(type="subagent", data={"phase": phase, **fields}, seq=seq)

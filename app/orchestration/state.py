@@ -54,6 +54,9 @@ class LoopState(BaseModel):
     current_model: str
     turn: int = 0
     tool_calls_made: int = 0
+    # 本次运行派发出去的子 agent 数（含嵌套层）。与 tool_calls_made 并列：
+    # 一次 spawn_agent 只算一次工具调用，但它背后可能是整棵委派树（plan/12 §5.1）。
+    subagents_spawned: int = 0
     usage: Usage = Field(default_factory=Usage)
     phase: LoopPhase = LoopPhase.pre_call
     status: str = "running"  # running | done | aborted

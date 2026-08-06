@@ -35,11 +35,18 @@ class ToolSpec(BaseModel):
 
 
 class ToolContext(BaseModel):
-    """执行上下文。运行期资源句柄由 executor 注入，不进入序列化。"""
+    """执行上下文。运行期资源句柄由 executor 注入，不进入序列化。
+
+    `agent_depth` 是调用方在委派树中的深度（plan/12 §5.1）。放在这里而不是放在
+    `SubagentRunner` 上：runner 是每请求一个的服务对象，全树共用一个实例，把位置
+    存在它身上会让孙 agent 也报 depth=1——这正是阶段 7 实测跑出 6 层嵌套的原因。
+    ToolContext 本就是「谁在调、带什么能力」的每次调用载体，深度属于同一类事实。
+    """
 
     tenant_id: str = ""
     session_id: str = ""
     agent_id: str = ""
+    agent_depth: int = 0
     trace_id: str = ""
     granted_scopes: list[str] = Field(default_factory=list)
     permission_mode: str = "default"
@@ -75,15 +82,15 @@ class PermissionDecision(BaseModel):
     reason: str | None = None
 
     @staticmethod
-    def allow() -> "PermissionDecision":
+    def allow() -> PermissionDecision:
         return PermissionDecision()
 
     @staticmethod
-    def deny(reason: str) -> "PermissionDecision":
+    def deny(reason: str) -> PermissionDecision:
         return PermissionDecision(denied=True, reason=reason)
 
     @staticmethod
-    def confirm(reason: str | None = None) -> "PermissionDecision":
+    def confirm(reason: str | None = None) -> PermissionDecision:
         return PermissionDecision(needs_confirmation=True, reason=reason)
 
 
