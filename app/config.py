@@ -80,6 +80,22 @@ class Settings(BaseSettings):
     agent_name: str = "AgentGate"
     agent_role: str = "一个有帮助的 AI 助手"
 
+    # —— 子 Agent 委派治理（plan/12 §5.1）——
+    # 四道闸。多 agent 是唯一没有天然天花板的成本维度：单 agent 的花费被上下文窗口封顶，
+    # 而每个子 agent 都是一个全新窗口，且这一切发生在**一次** HTTP 请求内，租户限流只数到 1。
+    subagent_enabled: bool = True
+    # 委派深度上限。1 = 只允许父直接派子（默认，最安全）。阶段 7 实测无任何深度检查，
+    # 离线探针跑出 6 层嵌套——这是刻意的行为收紧，不是纯修复。
+    # 放宽到 2 应等 M2 的 delegates_to 清单白名单落地：那时「谁能派给谁」由部署方声明。
+    subagent_max_depth: int = 1
+    # 单次运行的派发总次数上限（跨轮累计，含嵌套层）。
+    subagent_max_per_run: int = 6
+    # 整棵委派树共享的 token 预算。耗尽后子 agent 提前收尾并如实回报 stop_reason。
+    subagent_token_budget: int = 200_000
+    # 同时在跑的子 agent 数上限。tool_executor.MAX_TOOL_CONCURRENCY 只管一批工具同时跑
+    # 几个，管不住每个子 agent 内部各自再发的 LLM 调用。
+    subagent_max_concurrency: int = 4
+
     def fallback_model_list(self) -> list[str]:
         return [m.strip() for m in self.fallback_models.split(",") if m.strip()]
 

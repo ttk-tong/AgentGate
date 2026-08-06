@@ -44,6 +44,27 @@ agent_model_fallback_total = Counter(
     "agent_model_fallback_total", "Model fallback activations", ["from_model", "to_model"]
 )
 
+# ── Sub-agents / fleet ────────────────────────────────────────────────────────
+# 观测四问（plan/12 §10.3）：这次请求扇出了几个 agent、总共烧了多少 token、
+# 每个跑了多久、最深到几层。一个能把成本放大百倍的机制不可见，是最危险的组合。
+subagent_runs_total = Counter(
+    "subagent_runs_total", "Sub-agent runs", ["agent_type", "status"]
+)
+subagent_duration_seconds = Histogram(
+    "subagent_duration_seconds", "Sub-agent wall time", ["agent_type"],
+    buckets=(0.1, 0.5, 1, 2, 5, 10, 30, 60, 300),
+)
+subagent_depth = Histogram(
+    "subagent_depth", "Delegation depth at which a sub-agent ran",
+    buckets=(0, 1, 2, 3, 4, 5),
+)
+subagent_tokens_total = Counter(
+    "subagent_tokens_total", "Tokens burned inside sub-agents", ["direction"]
+)
+subagent_denied_total = Counter(
+    "subagent_denied_total", "Delegations refused by the fleet governor", ["reason"]
+)
+
 # ── Tools ─────────────────────────────────────────────────────────────────────
 tool_calls_total = Counter(
     "tool_calls_total", "Tool invocations", ["tool", "status"]

@@ -31,6 +31,7 @@ from app.domain.principal import Principal
 from app.mcp.manager import get_mcp_manager
 from app.observability.logging import get_logger, get_trace_id
 from app.orchestration.agent_loop import AgentLoop, ConfirmationPending
+from app.orchestration.fleet import FleetGovernor
 from app.orchestration.prompt.assembler import PromptAssembler
 from app.orchestration.prompt.composer import PromptComposer
 from app.orchestration.run_stream import (
@@ -181,15 +182,25 @@ async def _build_loop(
         },
     )
 
-    # —— 阶段 7：注入子 agent 执行体，并挂载 spawn_agent 工具（plan/03 §8、04 §8）——
+    # —— 阶段 7/8：注入子 agent 执行体，并挂载 spawn_agent 工具（plan/03 §8、04 §8、12 §5）——
     # session_id 为 None（如果未来出现无 session 的调用路径）就不挂 spawn_agent。
+    # 闸门（深度/扇出/预算/并发）在此创建一份，**同时给 runner 和 loop**——它必须是
+    # 「一次 run 内全树共享」的，两份账等于没账（plan/12 §5.1）。
+    circuit = CircuitBreaker(RedisCircuitStore(redis)) if redis is not None else None
+    governor = FleetGovernor.create(
+        token_budget=settings.subagent_token_budget,
+        max_depth=settings.subagent_max_depth,
+        max_spawns=settings.subagent_max_per_run,
+        max_concurrency=settings.subagent_max_concurrency,
+        enabled=settings.subagent_enabled,
+    )
     if session_id is not None:
         runner = SubagentRunner(
             provider=provider,
             registry=registry,
             default_model=settings.default_model,
-            store=store,
-            parent_session_id=session_id,
+            governor=governor,
+            circuit=circuit,
         )
         attach_spawn_agent(registry, runner)
 
@@ -223,7 +234,8 @@ async def _build_loop(
         external_user=external_user,
         tenant_id=tenant_id,
         granted_scopes=granted_scopes,
-        circuit=CircuitBreaker(RedisCircuitStore(redis)) if redis is not None else None,
+        governor=governor,
+        circuit=circuit,
     )
 
 

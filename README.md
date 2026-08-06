@@ -17,6 +17,7 @@
 | 每会话从零开始，没有记忆 | **长期记忆**：`remember` 工具 + 三级廉价召回（索引扫描 → 关键词粗排 → 小模型精选），无向量库依赖 |
 | 提示词一改缓存全失效 | **分层 Prompt 组装**：静态前缀带版本号求缓存 hash，动态块不破坏缓存前缀 |
 | 复杂任务只能单线程磨 | **子 Agent fan-out**：`spawn_agent` 并行委派，独立工具集收紧权限，中间过程不污染父上下文 |
+| 多 agent 一跑就失控：无限递归、成本不可见、子 agent 绕过 scope | **委派治理四道闸**：深度/扇出/token 预算/fleet 并发，能力只减不增（写进类型），整棵子树用量并进父账，`subagent` 事件实时可见 |
 
 ## 架构总览
 
@@ -282,6 +283,30 @@ tests/              # 离线单测 + 端到端
 - **隔离执行体**：`SubagentRunner` 跑受限完整子 Loop——独立工具集（`allowed_tools` **替换而非合并**父工具集）、独立事件流（不落父 DAG），只回传最终文本。
 - **并行 fan-out**：`spawn_agent` 标记 `is_read_only + is_concurrency_safe` → 执行器自动把多个调用归入同一并发批并行。
 - **sidechain 语义**：子过程标记事件不改父 head，投影自动跳过——中间过程不污染父 LLM 上下文，但保留审计。
+
+</details>
+
+<details>
+<summary><b>阶段 8：多 Agent 治理（栈深保护 + 成本可见）</b></summary>
+
+设计与分期计划见 [`.claude/plan/12-multi-agent.md`](.claude/plan/12-multi-agent.md)。核心定位：**子 agent 是「LLM 层面的函数调用」，属于上下文管理，不是编排框架**——压缩是垃圾回收（事后清理已进主堆的垃圾），子 agent 是栈帧回收（垃圾从不进主堆）。
+
+本阶段（M1）先把阶段 7 的地基做对。四个缺陷由离线探针实测确认，不是代码审查推断：
+
+| 缺陷 | 实测证据 | 修法 |
+|---|---|---|
+| 递归无上限 | 子 agent 能看到 `spawn_agent`，探针跑出 **6 层嵌套** | `FleetGovernor` 深度闸，深度随 `ToolContext.agent_depth` 逐层递增（旧版存在 runner 上，全树共用一个实例，所以孙 agent 也报 depth=1） |
+| 子 agent 绕过 MCP scope 校验 | 子 `ToolContext` 实测为 `tenant_id='' trace_id='' granted_scopes=[]`，而 MCP 代理把空 scope 当「未注入 → 不设卡」放行 | `AgentRunContext.child()` 是**唯一**派生途径且强制与父求交——能力放大在结构上不可能 |
+| 成本完全不可见 | 子 agent 实测烧 1234 进 / 567 出，父 `usage` 报告 **0** | 每轮扣减全树共享的 `TokenBudget`；整棵子树用量随返回值并进父账 |
+| fan-out 并发写同一 `AsyncSession` | 旧版子 agent 自己 `append_event`，N 个并发子 agent 共用请求作用域的同一个 session | 审计 trace 改走 `ContextMutation`，由父 loop 在批末**按模型原始调用顺序**串行落库 |
+
+- **四道闸**（深度 / 扇出 / 预算 / fleet 并发）：与「每条恢复路径都带 guard」是同一条铁律的树版本。判定放在 `check_permissions`——`deny` 会被执行器折成 error 结果回填，模型看得懂并会改策略。
+- **流式可见**：`subagent` 事件（started/finished/failed/denied）在**工具批执行期间**就流出去，不用等一次 300 秒的 fan-out 跑完；配 5 个 Prometheus 指标回答观测四问「扇出几个 / 烧了多少 / 跑了多久 / 多深」。
+- **韧性对等**：抽出 `llm_call` 让父子共用退避重试 + 熔断；子上下文超限走内存版 microcompact（占位化最旧工具结果，一次性 guard）。
+- **dangerous 工具在子 agent 侧直接从工具集滤掉**：子 loop 状态只在内存，挂起-确认无从恢复。
+- ⚠️ **行为收紧**：`SUBAGENT_MAX_DEPTH` 默认 1，嵌套派发会被明确拒绝（阶段 7 是无限）。放宽应等 M2 的 `delegates_to` 清单白名单落地。
+
+后续：M2 清单化 agent（`AGENT.md` + 结构化输出）、M3 拓扑（接力 / 汇总 / 显式编排 API）。
 
 </details>
 
