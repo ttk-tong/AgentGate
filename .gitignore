@@ -21,5 +21,8 @@ dist/
 .DS_Store
 Thumbs.db
 
+# AI 助手的本机配置（settings.local.json 里可能有本机路径/权限白名单，不入库）
+.claude/
+
 # Logs
 *.log

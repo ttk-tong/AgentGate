@@ -68,6 +68,11 @@ def _manager(configs, transports: dict[str, InMemoryTransport], *, now=None):
     return MCPManager(configs, **kw)
 
 
+def _ctx(*scopes: str) -> ToolContext:
+    """带 scope 的调用上下文。MCP 工具默认拒绝无 scope 的调用，测试也得授权。"""
+    return ToolContext(granted_scopes=list(scopes) or ["mcp:s"])
+
+
 # —— 命名空间 + 注册 ——
 
 
@@ -191,8 +196,51 @@ async def test_destructive_hint_makes_tool_dangerous():
     mgr.attach_to_registry(reg)
     proxy = reg.get("s__rm")
     assert proxy.spec.dangerous is True
-    decision = await proxy.check_permissions({}, ToolContext())
+    decision = await proxy.check_permissions({}, _ctx())
     assert decision.needs_confirmation is True
+
+
+# —— scope 默认拒绝（安全底线，见 mcp/proxy_tool）——
+
+
+async def test_mcp_tool_denied_without_scope():
+    """没带 mcp:{server} scope 一律拒。空 granted_scopes **不是**「放行」。
+
+    旧实现把空 scope 当成「没有权限系统」直接放行，于是任何漏传 scope 的调用路径
+    （子 agent 就是一例）都静默变成完全授权。
+    """
+    cfg = MCPServerConfig(name="s", transport="stdio", command="x")
+    t = _fake_transport(_tools(("f", {})))
+    mgr = _manager([cfg], {"s": t})
+    await mgr.start()
+
+    reg = ToolRegistry()
+    mgr.attach_to_registry(reg)
+    proxy = reg.get("s__f")
+    assert proxy.spec.requires_scopes == ["mcp:s"]
+
+    denied = await proxy.check_permissions({}, ToolContext())
+    assert denied.denied is True
+
+    # 通配也算：mcp:* 覆盖所有 server
+    assert (await proxy.check_permissions({}, _ctx("mcp:*"))).denied is False
+    # 别的 server 的 scope 不顶用
+    assert (await proxy.check_permissions({}, _ctx("mcp:other"))).denied is True
+
+
+async def test_mcp_tool_allows_internal_context_without_scope():
+    """没有请求主体的内部路径（定时任务/回放）用 internal=True 显式放行。"""
+    cfg = MCPServerConfig(name="s", transport="stdio", command="x")
+    t = _fake_transport(_tools(("f", {})))
+    mgr = _manager([cfg], {"s": t})
+    await mgr.start()
+
+    reg = ToolRegistry()
+    mgr.attach_to_registry(reg)
+    decision = await reg.get("s__f").check_permissions(
+        {}, ToolContext(internal=True)
+    )
+    assert decision.denied is False
 
 
 # —— server 失败隔离 ——
@@ -233,13 +281,13 @@ async def test_isolated_server_tool_denied_at_permission_stage():
         health.record_failure("boom")
     assert health.available() is False
 
-    decision = await proxy.check_permissions({}, ToolContext())
+    decision = await proxy.check_permissions({}, _ctx())
     assert decision.denied is True
 
     # 冷却期过后放行探测
     clock["t"] += health.cooldown_s + 1
     assert health.available() is True
-    decision2 = await proxy.check_permissions({}, ToolContext())
+    decision2 = await proxy.check_permissions({}, _ctx())
     assert decision2.denied is False
 
 
@@ -285,7 +333,7 @@ async def test_mcp_tool_executes_through_tool_executor():
     mgr.attach_to_registry(reg)
 
     calls = [ToolCall(id="1", name="s__echo", arguments={"msg": "ping"})]
-    results = await execute_batched(calls, reg, ToolContext())
+    results = await execute_batched(calls, reg, _ctx())
     assert results[0].ok is True
     assert results[0].display == "pong"
     # tools/call 确实发到了 server

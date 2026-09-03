@@ -9,7 +9,6 @@
 """
 from __future__ import annotations
 
-from uuid import uuid4
 
 from app.context.memory.recall import MemoryService
 from app.context.memory.store import InMemoryMemoryStore

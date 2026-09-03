@@ -10,6 +10,11 @@
 另外：
 - 带环检测（fork/resume 可能引入环）。
 - is_sidechain 事件默认不进入父上下文（子 agent 隔离，见 03 §8）。
+- **孤儿 tool_use 兜底**：投影出的消息序列保证「每个 assistant.tool_calls 都有
+  配对的 tool_result」——这是 OpenAI / Anthropic 双方都强制的协议约束，缺配对会
+  被端点 400 拒绝，且因为投影是纯函数、每轮重建，一次缺配对会让整个会话**永久**
+  不可用。Loop 在中止路径上已负责补写真实的「未执行」结果（精确原因），这里是
+  最后一道防线：兜住历史脏数据与未预料的路径（见 _close_orphan_tool_calls）。
 """
 from __future__ import annotations
 
@@ -69,7 +74,69 @@ def project_context(events: list[SessionEvent], head_id: UUID | None) -> list[LL
     chain = build_main_chain(events, head_id)
 
     # —— 3. 按 message_id 归并并行兄弟节点 ——
-    return _merge_and_render(chain)
+    messages = _merge_and_render(chain)
+
+    # —— 4. 孤儿 tool_use 兜底：保证消息序列符合协议 ——
+    return _close_orphan_tool_calls(messages)
+
+
+# 兜底补齐的结果内容。与 agent_loop 中止路径写入的真实事件区分（那边有精确 reason），
+# 这里只声明「没执行」，让模型知道该调用无效、可重试或换路径。
+ORPHAN_RESULT_CONTENT = '{"code": "not_executed", "reason": "orphan_tool_call"}'
+
+
+def _close_orphan_tool_calls(messages: list[LLMMessage]) -> list[LLMMessage]:
+    """为缺少配对结果的 tool_calls 补一条合成 tool 消息（纯函数）。
+
+    不变式：返回的序列里，每条带 tool_calls 的 assistant 消息，其后到下一条
+    assistant 消息之前，一定存在覆盖全部 call id 的 tool_result。
+
+    合成结果插在 assistant 消息**紧后面**（而不是窗口末尾）——OpenAI 要求 tool
+    角色消息紧随 assistant，插在最前是唯一无论窗口里有什么都合法的位置。
+    """
+    if not any(m.tool_calls for m in messages):
+        return messages  # 绝大多数轮次走这条快路径，零拷贝
+
+    out: list[LLMMessage] = []
+    i = 0
+    n = len(messages)
+    while i < n:
+        msg = messages[i]
+        if msg.role != Role.assistant or not msg.tool_calls:
+            out.append(msg)
+            i += 1
+            continue
+
+        # 窗口 = 该 assistant 之后、下一条 assistant 之前的所有消息
+        j = i + 1
+        window: list[LLMMessage] = []
+        answered: set[str] = set()
+        while j < n and messages[j].role != Role.assistant:
+            window.append(messages[j])
+            for r in messages[j].tool_results:
+                answered.add(r.tool_call_id)
+            j += 1
+
+        out.append(msg)
+        missing = [c.id for c in msg.tool_calls if c.id not in answered]
+        if missing:
+            out.append(
+                LLMMessage(
+                    role=Role.tool,
+                    tool_results=[
+                        ToolResultMessage(
+                            tool_call_id=cid,
+                            content=ORPHAN_RESULT_CONTENT,
+                            is_error=True,
+                        )
+                        for cid in missing
+                    ],
+                )
+            )
+        out.extend(window)
+        i = j
+
+    return out
 
 
 def _merge_and_render(chain: list[SessionEvent]) -> list[LLMMessage]:
@@ -118,6 +185,32 @@ def _merge_and_render(chain: list[SessionEvent]) -> list[LLMMessage]:
             group_index[ev.message_id] = len(messages) - 1
 
     return messages
+
+
+def find_orphan_tool_calls(
+    events: list[SessionEvent], head_id: UUID | None
+) -> list[ToolCall]:
+    """主链上「有 tool_use 但没配对 tool_result」的调用（事件层，纯函数）。
+
+    与 _close_orphan_tool_calls 同源同定义，只是作用在事件而非渲染后的消息上：
+    调用方（Loop 的自愈路径）据此往 DAG 真正补写配对事件，把脏数据修掉，而不是
+    每轮靠投影兜底。
+    """
+    chain = build_main_chain(events, head_id)
+    pending: dict[str, ToolCall] = {}
+    for ev in chain:
+        if ev.kind != EventKind.message or not ev.content:
+            continue
+        if ev.role == Role.assistant:
+            for b in ev.content:
+                if b.type == "tool_use" and b.tool_call_id and b.tool_name:
+                    pending[b.tool_call_id] = ToolCall(
+                        id=b.tool_call_id, name=b.tool_name, arguments=b.arguments or {}
+                    )
+        for b in ev.content:
+            if b.type == "tool_result" and b.tool_call_id:
+                pending.pop(b.tool_call_id, None)
+    return list(pending.values())
 
 
 def _render_content(content: list[ContentBlock] | None) -> str:

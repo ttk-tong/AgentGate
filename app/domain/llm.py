@@ -69,7 +69,12 @@ class LLMRequest(BaseModel):
     system: str | None = None
     messages: list[LLMMessage] = Field(default_factory=list)
     max_tokens: int = 4096
-    temperature: float = 1.0
+    # None = 不发这个字段，用服务端默认值。
+    #
+    # 这里必须是 None 而不是 1.0：新一代模型（Opus 5 / Sonnet 5 / Fable 5 等）已经
+    # 移除了 temperature，收到就是 400 —— 一个「无害的默认值」会让整个 Anthropic
+    # 路径在这些模型上完全不可用。只有调用方显式设了才发。
+    temperature: float | None = None
     # 暴露给模型的工具声明（OpenAI function-calling 格式）。空则不带 tools 字段。
     tools: list[dict[str, Any]] = Field(default_factory=list)
 

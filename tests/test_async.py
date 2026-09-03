@@ -10,7 +10,6 @@
 """
 from __future__ import annotations
 
-import pytest
 
 from app.async_.idempotency import InMemoryDoneStore
 from app.async_.lock import InMemoryLock

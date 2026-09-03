@@ -10,8 +10,9 @@ call），所以对 `tool_executor` 完全透明——分批、超时、错误�
 - `validate_input`：沿用 BaseTool 的 required 检查。**不做**完整 JSON Schema 校验
   ——远端 server 自己会校验并回 isError，重复实现一遍 schema 校验器只会引入
   「我们拒了但 server 其实能接受」的假阴性。
-- `check_permissions`：scope 校验（mcp:{server}）+ dangerous 确认 + server 熔断状态。
-  熔断放在这里而不是 call 里，是为了在**执行前**就短路掉，不浪费超时预算。
+- `check_permissions`：scope 校验（mcp:{server}，**默认拒绝**）+ dangerous 确认
+  + server 熔断状态。熔断放在这里而不是 call 里，是为了在**执行前**就短路掉，
+  不浪费超时预算。
 - `call`：转发到 client，把 MCPCallResult 折成 ToolResult。
 
 `mutation` 恒为 None：MCP 工具的副作用发生在远端，不改我们的会话上下文。
@@ -71,11 +72,13 @@ class MCPToolProxy(BaseTool):
     async def check_permissions(self, args: dict, ctx: ToolContext) -> PermissionDecision:
         """scope → 熔断 → dangerous 确认，按「最便宜的拒绝先做」排序。"""
         # 1) scope：MCP server 是外部系统，调它需要显式授权（mcp:{server} 或 mcp:*）。
-        #    granted_scopes 为空时放行——沿用既有约定：scope 由 API 层统一注入，
-        #    未注入（如内部调用/dev 匿名）不在工具层二次设卡。
-        if ctx.granted_scopes:
-            required = self.spec.requires_scopes
-            if required and not all(scope_allows(ctx.granted_scopes, s) for s in required):
+        #    **默认拒绝**：声明了 requires_scopes 就必须拿到匹配的 scope，
+        #    granted_scopes 为空一律拒。旧实现是「空 scope 放行」，于是任何漏传
+        #    scope 的调用路径（子 agent 就是一例）都会静默变成完全授权。
+        #    没有请求主体的内部路径要用 ToolContext.internal=True 显式声明。
+        required = self.spec.requires_scopes
+        if required and not ctx.internal:
+            if not all(scope_allows(ctx.granted_scopes, s) for s in required):
                 return PermissionDecision.deny(
                     f"缺少调用 MCP server {self._server!r} 所需的 scope: {required}"
                 )

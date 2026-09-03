@@ -31,6 +31,12 @@ from app.security.store import DbKeyStore
 # dev 匿名租户：auth_required=False 且无凭证时，归到一个固定租户，便于本地调试。
 _ANON_TENANT = uuid.UUID(int=0)
 
+# dev 匿名 Principal 的 scope。**刻意不含 admin:***——否则漏配 AUTH_REQUIRED 就等于
+# 把「给任意租户签发 API Key」的 /v1/admin/* 挂到公网。config 的启动校验已经拦住了
+# 非 dev 环境，这里是第二道：即使拦漏了，匿名主体也拿不到特权接口。
+# 首把 admin key 由 scripts/seed_api_key.py 直连 DB 播种，不依赖匿名放行。
+_ANON_SCOPES = ["sessions:write", "tasks:write", "mcp:*"]
+
 # auto_error=False：无凭证时返回 None 而非直接 403，保留 dev 匿名放行逻辑；
 # 同时把 bearer scheme 注册进 OpenAPI，Swagger UI 会显示 Authorize 按钮。
 _bearer_scheme = HTTPBearer(auto_error=False, description="API Key：ak_<prefix>_<secret>")
@@ -43,8 +49,9 @@ async def require_principal(
 ) -> Principal:
     """解析 Bearer 凭证为 Principal。
 
-    auth_required=False（dev）且无凭证 → 返回匿名 Principal（admin scope）。
-    有凭证则必须有效，否则 401——即便 dev 也不放行「提供了但错误」的凭证。
+    auth_required=False（仅 dev 可配）且无凭证 → 返回匿名 Principal，scope 为
+    _ANON_SCOPES（不含 admin）。有凭证则必须有效，否则 401——即便 dev 也不放行
+    「提供了但错误」的凭证。
     """
     settings = get_settings()
 
@@ -52,7 +59,7 @@ async def require_principal(
         return Principal(
             tenant_id=_ANON_TENANT,
             subject="anonymous",
-            scopes=["admin:*"],
+            scopes=list(_ANON_SCOPES),
             auth_type="api_key",
         )
     if credentials is None:
@@ -72,7 +79,8 @@ async def require_admin(
     """管理接口守卫：要求 admin:* scope（发/吊 key、建租户等特权操作）。
 
     只有平台运营方的 admin key 能过。普通租户 key（sessions:* 等）一律 403，
-    杜绝租户自助发 key 提权。dev 匿名 Principal 自带 admin:*，本地照常可调。
+    杜绝租户自助发 key 提权。dev 匿名 Principal **也不放行**——首把 admin key
+    走 scripts/seed_api_key.py 直连 DB 播种（见 _ANON_SCOPES 的说明）。
     """
     if not scope_allows(principal.scopes, "admin:*"):
         raise Forbidden("admin scope required")

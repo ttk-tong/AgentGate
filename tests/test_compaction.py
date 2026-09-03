@@ -15,7 +15,6 @@ from datetime import UTC, datetime
 import pytest
 
 from app.context import compactor
-from app.context.projection import project_context
 from app.context.session_store import SessionStore
 from app.domain.enums import EventKind, Role
 from app.domain.models import ContentBlock, SessionEvent

@@ -41,3 +41,37 @@ include = ["app*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+# mypy 配置放在 pyproject 而不是 mypy.ini：ini 文件由 configparser 按**系统 locale**
+# 解码，中文注释在 GBK 环境（中文 Windows）下直接把 mypy 打崩成 UnicodeDecodeError。
+# TOML 规范强制 UTF-8，注释想写中文就写中文。
+[tool.mypy]
+python_version = "3.11"
+# 全局基线：不要求全部注解，但检查函数体、禁止隐式 Optional、清理死 ignore。
+# 这几项能抓到真实类型错误，又不会因存量代码缺注解而误报。
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+# core 模块严格：要求完整注解（类型安全是这个项目气质的一部分）。
+# 这些模块是纯领域模型/配置，无外部副作用，最先收紧。
+[[tool.mypy.overrides]]
+module = ["app.domain.*", "app.config"]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+
+[[tool.mypy.overrides]]
+module = "app.domain.*"
+warn_return_any = true
+
+# 第三方库缺类型存根时忽略（不影响业务代码检查）
+[[tool.mypy.overrides]]
+module = [
+    "structlog.*",
+    "prometheus_client.*",
+    "opentelemetry.*",
+    "apscheduler.*",
+    "asyncpg.*",
+]
+ignore_missing_imports = true

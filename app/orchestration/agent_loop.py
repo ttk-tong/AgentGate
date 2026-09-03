@@ -24,6 +24,7 @@ from app.context.context_builder import (
     compact_threshold,
     estimate_request_tokens,
 )
+from app.context.projection import find_orphan_tool_calls
 from app.context.session_store import SessionStore
 from app.domain.enums import EventKind, Role, SessionState
 from app.domain.errors import PromptTooLong, ProviderOverloaded, ProviderUnavailable
@@ -139,6 +140,56 @@ class AgentLoop:
             return base
         return min(base * (2 ** st.output_recovery_count), base * 4)
 
+    async def _close_pending_tool_calls(self, session_id, calls: list[ToolCall], reason: str):
+        """给「已落库但不会执行」的 tool_use 补写配对的 tool 结果事件，返回新 head。
+
+        assistant 事件在「要不要执行工具」**之前**就落库了（流式必须边收边存），
+        所以每条不执行的分支——截断续写、超限中止、finish_reason 不匹配、确认被
+        放弃——都必须在这里配对。否则下一轮投影会送出「有 tool_calls 没
+        tool_result」的非法消息序列被端点 400 拒绝；而投影是纯函数、每轮从 DAG
+        重建，这个 400 会**永久**复现，整个会话报废。
+        """
+        if not calls:
+            return None
+        blocks = [
+            ContentBlock(
+                type="tool_result",
+                tool_call_id=c.id,
+                tool_name=c.name,
+                result={"code": "not_executed", "reason": reason},
+                is_error=True,
+            )
+            for c in calls
+        ]
+        head_id = await self.store.append_event(
+            session_id,
+            kind=EventKind.message,
+            role=Role.tool,
+            content=blocks,
+        )
+        log.info(
+            "tool_calls_closed_unexecuted",
+            session_id=str(session_id),
+            reason=reason,
+            count=len(calls),
+        )
+        return head_id
+
+    async def heal_orphan_tool_calls(self, session_id, reason: str = "not_executed") -> int:
+        """扫主链，给残留的孤儿 tool_use 补写配对结果，返回补了几条。
+
+        自愈入口：兜住「进程被杀 / 确认被放弃过期 / 历史脏数据」这类不经过中止
+        分支的情况。必须在写入新的 user 消息**之前**调用——tool 结果必须紧跟
+        assistant，插到 user 消息后面同样非法。
+        """
+        events = await self.store.list_events(session_id)
+        sess = await self.store.get_session(session_id)
+        orphans = find_orphan_tool_calls(events, sess.head_event_id if sess else None)
+        if not orphans:
+            return 0
+        await self._close_pending_tool_calls(session_id, orphans, reason)
+        return len(orphans)
+
     async def _stream_with_retry(self, request: LLMRequest) -> AsyncIterator:
         """Retry only before emitting a provider chunk; emitted streams are not replayable."""
         class _NoRetryOverload(Exception):
@@ -173,6 +224,12 @@ class AgentLoop:
 
     async def run(self, session_id, user_text: str) -> AsyncIterator[Event]:
         """驱动一次用户输入的完整运行，产出对外 Event 流。"""
+        # 自愈：上一次运行可能留下没配对的 tool_use（进程被杀、确认被放弃过期等）。
+        # 必须在写 user 消息之前补，否则 tool 结果会排到 user 之后，依然非法。
+        healed = await self.heal_orphan_tool_calls(session_id, "not_executed")
+        if healed:
+            log.warning("orphan_tool_calls_healed", session_id=str(session_id), count=healed)
+
         # —— 阶段 6：按本轮用户输入动态组装 prompt（召回记忆 + 激活技能）——
         # 有 composer 才走；组装出的 system 与工具子集只作用于本次 run（loop 每请求新建）。
         if self.prompt_composer is not None:
@@ -473,7 +530,13 @@ class AgentLoop:
 
             # —— max-output 恢复：被截断且未耗尽次数 → 升 max_tokens 后续写（plan/03 §4）——
             # 已落库的部分响应会进入下一轮投影，模型据此继续；带次数上限 guard。
+            # 截断时 tool_use 的参数 JSON 大概率也是残缺的，一律不执行、补写未执行结果。
             if finish_reason == "max_tokens":
+                closed = await self._close_pending_tool_calls(
+                    session_id, tool_calls, "output_truncated"
+                )
+                if closed is not None:
+                    st.head_event_id = closed
                 if st.output_recovery_count < self.cfg.max_output_recovery:
                     st.output_recovery_count += 1
                     log.info(
@@ -488,20 +551,36 @@ class AgentLoop:
                 st.status = "done"
                 st.stop_reason = STOP_COMPLETED
                 seq += 1
-                yield Event.done(STOP_COMPLETED, str(head_id), st.usage.model_dump(), seq)
+                yield Event.done(
+                    STOP_COMPLETED, str(st.head_event_id), st.usage.model_dump(), seq
+                )
                 return
 
             # —— 终止判定：模型这轮没调工具 = 自然结束 ——
             if finish_reason != "tool_use" or not tool_calls:
+                # 少数端点会给出 tool_calls 却报 stop。保守起来：不执行，但必须配对，
+                # 否则同样会污染后续投影。
+                closed = await self._close_pending_tool_calls(
+                    session_id, tool_calls, "finish_reason_mismatch"
+                )
+                if closed is not None:
+                    st.head_event_id = closed
                 st.phase = LoopPhase.done
                 st.status = "done"
                 st.stop_reason = STOP_COMPLETED
                 seq += 1
-                yield Event.done(STOP_COMPLETED, str(head_id), st.usage.model_dump(), seq)
+                yield Event.done(
+                    STOP_COMPLETED, str(st.head_event_id), st.usage.model_dump(), seq
+                )
                 return
 
             # —— max_tool_calls guard ——
             if st.tool_calls_made + len(tool_calls) > self.cfg.max_tool_calls:
+                closed = await self._close_pending_tool_calls(
+                    session_id, tool_calls, "max_tool_calls"
+                )
+                if closed is not None:
+                    st.head_event_id = closed
                 yield _abort(st, STOP_MAX_TOOL_CALLS, seq)
                 return
 
@@ -635,6 +714,8 @@ class AgentLoop:
         """构造副作用应用器：把 ContextMutation 按 kind 落到会话上下文。
 
         由 executor 在批结束后按模型原始调用顺序串行调用，保证确定性、无竞态。
+        这条串行通道是**唯一**允许写父 DAG 的地方——并发批里的工具协程共用父的
+        AsyncSession，直接写库会两个协程同时用一个 session（见 subagent 模块文档）。
         """
 
         async def apply(mutation: ContextMutation) -> None:
@@ -642,10 +723,44 @@ class AgentLoop:
                 await self.store.append_note(session_id, mutation.payload.get("text", ""))
             elif mutation.kind == "remember":
                 await self._apply_remember(session_id, mutation.payload)
+            elif mutation.kind == "subagent_marker":
+                # 与 tools/builtin/spawn_agent.SUBAGENT_MARKER_KIND 对齐。这里写
+                # 字面量而不 import：agent_loop 不该为一个常量把 spawn_agent
+                # （→ subagent → tool_executor）拉进自己的导入图，其余 kind 也是
+                # 同样的字面量约定。
+                await self._apply_subagent_marker(session_id, mutation.payload)
             else:
                 log.warning("unknown_mutation", kind=mutation.kind)
 
         return apply
+
+    async def _apply_subagent_marker(self, session_id, payload: dict) -> None:
+        """子 agent 审计留痕：一条 is_sidechain 事件，记任务 + 最终结论。
+
+        `is_sidechain=True` 让它既不进父投影、也不改父 head（见 session_store
+        .append_event），所以对上下文完全透明——它只为「谁在什么时候派了什么活、
+        拿回了什么」这个审计问题存在。start/end 两条合成一条：派发那一刻还没有
+        结论，两条事件之间隔着整个子 loop，中间崩了就只剩一条悬空的 start。
+        """
+        agent_id = str(payload.get("agent_id") or "unknown")
+        ok = bool(payload.get("ok", True))
+        text = str(payload.get("text") or "")
+        lines = [
+            f"[subagent:{agent_id}] {'ok' if ok else 'failed'}"
+            f" turns={payload.get('turns', 0)}"
+            f" tools={payload.get('allowed_tools') or []}",
+            f"task: {payload.get('task') or ''}",
+            f"result: {text}",
+        ]
+        await self.store.append_event(
+            session_id,
+            kind=EventKind.message,
+            role=Role.assistant,
+            content=[ContentBlock(type="text", text="\n".join(lines))],
+            is_sidechain=True,
+            agent_id_ref=agent_id,
+        )
+        log.info("subagent_marker_recorded", session_id=str(session_id), agent_id=agent_id, ok=ok)
 
     async def _apply_remember(self, session_id, payload: dict) -> None:
         """remember 工具的副作用：写入长期记忆（plan/06 §4.1）。

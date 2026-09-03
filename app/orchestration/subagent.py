@@ -5,14 +5,23 @@
 
 关键性质：
 - **隔离**：子 agent 有自己的事件流（in-memory，不写父 DAG），独立工具集
-  （`allowed_tools` 替换而非合并），可用更便宜的模型。
+  （`allowed_tools` 替换而非合并，且再与父的可用工具集**求交**），可用更便宜的模型。
 - **只返最终文本**：中间推理与工具调用只在子 agent 内部循环，父只拿到
   `run()` 的返回值——中间过程不污染父上下文。
-- **审计留痕**：父 DAG 里落两条 `is_sidechain=True` 的标记事件（start / end），
-  记录派发的任务与最终结果，但**不进入父投影**（见 projection.build_main_chain
-  与 session_store.append_event 对 sidechain 的特殊处理）。
+- **权限不放大**：父的 tenant_id / granted_scopes 原样透传给子的 ToolContext。
+  子 agent 只能是父权限的**子集**，不能是超集——这是安全底线，别指望
+  「反正子 agent 只读」。
+- **审计留痕**：一条 `is_sidechain=True` 的标记事件记录派发的任务与最终结果，
+  但**不进入父投影**（见 projection.build_main_chain 与 session_store.append_event
+  对 sidechain 的特殊处理）。该事件由**父 loop** 在批结束后串行写入（见下）。
 - **可 fan-out**：`spawn_agent` 工具本身是只读+并发安全的，多次调用会被
   tool_executor 归入并发批（plan/04 §8），从而在同一轮里并行派发多个子 agent。
+
+为什么审计事件不在这里写：`spawn_agent` 会 fan-out，多个子 agent 在同一个并发批
+里跑，而父的 `AsyncSession` 不是并发安全的——在子协程里直接 append_event 等于让
+多个协程同时用一个 session。所以 runner 只产出 outcome，由 `spawn_agent` 挂成
+`ContextMutation`，executor 在批结束后**按调用顺序串行**交给父 loop 落库
+（见 tool_executor 的副作用延迟应用）。
 
 刻意不做的事（保持精简）：
 - 不接压缩/记忆召回/技能激活——子 agent 用途是「短平快子任务」，重量级流水线
@@ -23,11 +32,11 @@ from __future__ import annotations
 
 from uuid import uuid4
 
-from app.context.session_store import SessionStore
-from app.domain.enums import EventKind, Role
+from pydantic import BaseModel
+
+from app.domain.enums import Role
 from app.domain.errors import ProviderError
 from app.domain.llm import LLMMessage, LLMRequest, ToolCall
-from app.domain.models import ContentBlock
 from app.domain.subagent import SubAgentSpec
 from app.domain.tool import ToolContext, ToolResult
 from app.observability.logging import get_logger
@@ -42,12 +51,29 @@ _DEFAULT_SYSTEM = (
     "只使用被授权的工具，简洁作答；给出可直接被父采纳的最终结论。"
 )
 
+# 永不下传给子 agent 的工具。spawn_agent 必须在这里：子 agent 复用父的 registry，
+# 里面那个 spawn_agent 持有同一个 runner，于是子能派孙、孙能派曾孙——没有深度计数
+# 器的情况下这是指数级 fan-out，一次调用就能把 provider 配额和进程打光。
+# 递归委派没有实际收益（父就在上面），所以直接从可授权集合里剔掉。
+_NEVER_DELEGATED = frozenset({"spawn_agent"})
+
+
+class SubAgentOutcome(BaseModel):
+    """一次子 agent 运行的结果。父侧据此回填模型 + 落审计事件。"""
+
+    agent_id: str
+    text: str
+    turns: int = 0
+    ok: bool = True
+
 
 class SubagentRunner:
     """把 `run_subagent` 收敛成可注入的执行体（plan/03 §8）。
 
-    构造期接受父 loop 的资源引用（provider/registry/model/store 与父 session_id），
+    构造期接受父 loop 的资源引用（provider/registry/model 与父的身份/权限），
     运行期按 `SubAgentSpec` 隔离出子 loop。父 loop 每请求新建，天然作用域一致。
+
+    注意这里**不再持有 SessionStore**：子 agent 不写库（见模块文档）。
     """
 
     def __init__(
@@ -55,32 +81,48 @@ class SubagentRunner:
         provider: Provider,
         registry: ToolRegistry,
         default_model: str,
-        store: SessionStore,
         parent_session_id,
+        *,
+        tenant_id: str | None = None,
+        granted_scopes: list[str] | None = None,
+        parent_tools: list[str] | None = None,
     ):
         self._provider = provider
         self._registry = registry
         self._default_model = default_model
-        self._store = store
         self._parent_session_id = parent_session_id
+        self._tenant_id = tenant_id or ""
+        # 父的授权原样下传：子 agent 权限 ⊆ 父权限
+        self._granted_scopes = list(granted_scopes or [])
+        # 父这轮暴露给模型的工具名集合；None 表示注册表全集。子的 allowed_tools
+        # 要与它求交，防止模型自己写出一个父都没有的工具名来提权。
+        self._parent_tools = parent_tools
 
-    async def run(self, spec: SubAgentSpec) -> str:
-        """跑一个子 agent，返回最终文本。任何异常都收敛成异常消息回给父。"""
+    def allowed_tools(self, requested: list[str]) -> list[str]:
+        """requested ∩ 父工具集 − 黑名单，保持 requested 的顺序。
+
+        求交而不是照抄：模型完全可以在 allowed_tools 里写一个父这轮没被授权的
+        工具名，registry 里却有——那就成了「子 agent 比父 agent 权限大」。
+        """
+        parent = set(self._parent_tools if self._parent_tools is not None else self._registry.names())
+        return [
+            t for t in requested if t in parent and t not in _NEVER_DELEGATED
+        ]
+
+    async def run(self, spec: SubAgentSpec) -> SubAgentOutcome:
+        """跑一个子 agent。任何异常都收敛成异常消息回给父，不把父带崩。"""
         child_agent_id = f"sub-{uuid4().hex[:8]}"
         model = spec.model or self._default_model
         system = spec.system_prompt or _DEFAULT_SYSTEM
         # `allowed_tools` 替换（非合并），未指定则空集
         tools_schema = self._registry.to_openai_schema(spec.allowed_tools)
 
-        # 审计标记：把「派发这次子 agent」写成一条 sidechain 事件（不进父投影）
-        await self._record_marker(
-            child_agent_id, kind="start", text=f"[subagent:{child_agent_id}] {spec.task}"
-        )
-
         # 子 loop 的消息状态完全在内存里，不落父 DAG
         messages: list[LLMMessage] = [LLMMessage(role=Role.user, content=spec.task)]
 
         final_text = ""
+        text_acc = ""  # max_turns 用尽时要回传最后一条 assistant 文本，先给个初值
+        ok = True
         turn = 0
         try:
             while turn < spec.max_turns:
@@ -122,14 +164,14 @@ class SubagentRunner:
                 final_text = text_acc or "[subagent] max_turns reached without a final answer"
         except ProviderError as e:
             final_text = f"[subagent-error] provider: {e}"
+            ok = False
         except Exception as e:  # noqa: BLE001  子 agent 崩溃不应把父带崩
             log.warning("subagent_crashed", agent_id=child_agent_id, error=str(e))
             final_text = f"[subagent-error] {e}"
+            ok = False
 
-        await self._record_marker(
-            child_agent_id, kind="end", text=f"[subagent:{child_agent_id}] result: {final_text}"
-        )
-        return final_text
+        log.info("subagent_finished", agent_id=child_agent_id, turns=turn, ok=ok)
+        return SubAgentOutcome(agent_id=child_agent_id, text=final_text, turns=turn, ok=ok)
 
     # —— 内部辅助 ——
 
@@ -150,10 +192,16 @@ class SubagentRunner:
     async def _execute_tools(
         self, tool_calls: list[ToolCall], child_agent_id: str
     ) -> list[ToolResult]:
-        """复用父的读写分批执行器。子 agent 独立 agent_id 便于审计。"""
+        """复用父的读写分批执行器。子 agent 独立 agent_id 便于审计。
+
+        ctx 带上父的 tenant_id 与 granted_scopes：不带等于让子 agent 在权限检查
+        里「没有主体」，那正是提权口子（见 mcp/proxy_tool 的 scope 默认拒绝）。
+        """
         ctx = ToolContext(
+            tenant_id=self._tenant_id,
             session_id=str(self._parent_session_id),
             agent_id=child_agent_id,
+            granted_scopes=self._granted_scopes,
         )
         return await execute_batched(
             tool_calls,
@@ -163,18 +211,6 @@ class SubagentRunner:
             # 让工具的 mutation 停留在 result 上不被落库。这符合「隔离」的意图。
             apply_mutation=None,
         )
-
-    async def _record_marker(self, agent_id: str, *, kind: str, text: str) -> None:
-        """在父 DAG 写一条 sidechain 标记事件（审计用，不进父投影）。"""
-        await self._store.append_event(
-            self._parent_session_id,
-            kind=EventKind.message,
-            role=Role.assistant,
-            content=[ContentBlock(type="text", text=text)],
-            is_sidechain=True,
-            agent_id_ref=agent_id,
-        )
-        log.info("subagent_marker", agent_id=agent_id, kind=kind)
 
 
 def _result_to_message(call: ToolCall, result: ToolResult):

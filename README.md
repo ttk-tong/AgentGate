@@ -119,6 +119,13 @@ curl -s -X POST localhost:8000/v1/sessions/$SID/messages \
 
 dev 默认 `AUTH_REQUIRED=false` 匿名放行（所有人归一个匿名租户，仅供本地调试）。compose 里 app 服务已默认 `AUTH_REQUIRED=true`，即生产形态；临时敞开用`AUTH_REQUIRED=false docker compose up -d app`。
 
+> **非 dev 环境的启动自检（会让进程起不来，不是 warning）。** `APP_ENV` 不是 `dev` 时，以下两种配置直接抛 `ValueError` 拒绝启动，两个问题一次报全：
+>
+> - `AUTH_REQUIRED=false` —— 未带凭证的请求会拿到匿名 Principal，等于把接口挂到公网；
+> - `AUTH_SALT` 仍是仓库里自带的 `dev-insecure-salt-change-me` —— 算 key 哈希的材料在公开仓库里，哈希等于没做。
+>
+> 「漏配一个环境变量就把发 key 接口敞开」是这类网关最常见的事故，所以拦截点放在**构造 Settings** 时，而不是靠部署文档提醒。匿名 Principal 的 scope 集合另外硬编码为不含 `admin:*`（第二道防线：即便 `APP_ENV` 被误写成 `dev` 部署到线上，`/v1/admin/*` 仍然拒绝）。两道防线都有测试钉住（`tests/test_config_security.py`）。
+
 **管理接口**（`/v1/admin/*`，全部要求 `admin:*` scope，禁止签发特权 key，杜绝租户自助提权）：
 
 | 方法 | 路径 | 说明 |
@@ -222,7 +229,8 @@ tests/              # 离线单测 + 端到端
 不带工具的对话端到端闭环（walking skeleton）：
 
 - **DAG 投影**（`context/projection.py`）：父指针回溯 + `compact_boundary` 截断 + 按 `message_id` 归并并行兄弟节点 + 环检测 + sidechain 排除。纯函数，单测覆盖。
-- **Provider 适配器**（`routing/providers/`）：Anthropic 流式 SSE 解析；无 API key 时用 Mock，保证无网络也能跑通。
+- **协议不变式两道防线**：每条带 `tool_calls` 的 assistant 消息，在下一条 assistant 之前必须有配对的 `tool_result`。中断（确认超时 / 进程崩溃 / 各类中止分支）会留下没有结果的 `tool_use`——而 DAG 是 append-only，**删不掉**，非法序列会每一轮被重新投影出去、被 provider 每一轮 400，会话永久报废。所以：事件层在每轮入口自愈（`heal_orphan_tool_calls` 幂等补写真实配对事件），投影层再兜一次底（`_close_orphan_tool_calls` 合成结果）。
+- **Provider 适配器**（`routing/providers/`）：Anthropic Messages / OpenAI 兼容两套 SSE 解析；无 API key 时用 Mock，保证无网络也能跑通。**跨 provider 语义等价**是硬约束——上层 Loop 只认 `StreamChunk` 和 `PromptTooLong / ProviderOverloaded / ProviderUnavailable`，任何一个适配器漏掉状态码→异常的映射，反应式压缩、重试、模型降级、熔断器就会在那条路径上**全部静默失效**。所以状态判定只存在一份（`providers/http_errors.py`，含 200 之后的流中 `error` 事件），并由 `tests/test_provider_contract.py` 用**同一批断言**分别打到两种线上格式（36 个用例）。
 - **最小 Agent Loop**（`orchestration/agent_loop.py`）：显式状态机 `PRE_CALL → LLM_CALL → STOP → DONE`，命名转移与恢复 guard 字段一步到位。
 - **会话串行锁**（`orchestration/session_lock.py`）：`lock:session:{id}`，Redis SET NX + Lua 校验释放。
 
@@ -282,6 +290,19 @@ tests/              # 离线单测 + 端到端
 - **隔离执行体**：`SubagentRunner` 跑受限完整子 Loop——独立工具集（`allowed_tools` **替换而非合并**父工具集）、独立事件流（不落父 DAG），只回传最终文本。
 - **并行 fan-out**：`spawn_agent` 标记 `is_read_only + is_concurrency_safe` → 执行器自动把多个调用归入同一并发批并行。
 - **sidechain 语义**：子过程标记事件不改父 head，投影自动跳过——中间过程不污染父 LLM 上下文，但保留审计。
+
+</details>
+
+<details>
+<summary><b>阶段 8：MCP 外部工具接入（三层信任映射）</b></summary>
+
+- **两种传输**（`mcp/transport/`）：stdio（本地子进程，`npx` / `uvx` 冷启动给到 90s 握手超时）与 Streamable HTTP。Manager 是**进程级常驻**的，握手成本不摊到任何一次对话延迟上。
+- **三层信任映射**（`mcp/mapping.py`，整个集成的判断核心）：MCP server 是第三方代码，其 annotations 按规范只是 hint。所以 —— 第 1 层运维配置 `readonly_tools`（**唯一**能授予并发安全的途径，因为并发跑写操作的后果由部署方承担）；第 2 层 server annotations（只用于**收紧**，如 `destructiveHint` → 强制人工确认，以及填充非安全关键字段）；第 3 层保守默认（写工具、串行）。一句话：**annotations 可以让工具更受限，不能让工具更自由。**
+- **命名空间**：`{server}__{tool}`，用 `__` 而非 `:` / `.`（function name 合法字符集是 `[a-zA-Z0-9_-]`），超 64 字符截断且保持唯一。
+- **scope 默认拒绝**：代理工具声明 `mcp:{server}`，必须拿到匹配 scope（或 `mcp:*`）才放行。没有请求主体的内部路径要用 `ToolContext.internal=True` 显式声明。
+- **单条配置坏掉不阻塞启动**：解析失败的 server 条目告警跳过，其余照常加载；含凭证的 `headers`/`env` 值永不进日志（`redacted()`）。
+
+> ⚠️ **相对早期版本的行为变更**：`granted_scopes` 为空时，MCP 代理工具从「放行」改成「拒绝」。旧语义下任何漏传 scope 的调用路径（子 agent 就是一例）都会**静默**变成完全授权——这类"失败开放"的默认值是安全审计里最典型的一条。升级后如果 MCP 工具突然被拒，是缺 scope，不是 bug：给 key 加上 `mcp:{server}`，或给内部调用路径设 `internal=True`。
 
 </details>
 

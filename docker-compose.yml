@@ -41,7 +41,7 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      DEFAULT_MODEL: ${DEFAULT_MODEL:-claude-opus-4-8}
+      DEFAULT_MODEL: ${DEFAULT_MODEL:-claude-opus-5}
       # —— 认证/限流 ——
       # 默认强制认证：无凭证一律 401，复现生产鉴权行为。临时敞开设 AUTH_REQUIRED=false。
       AUTH_REQUIRED: ${AUTH_REQUIRED:-true}

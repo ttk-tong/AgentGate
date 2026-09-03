@@ -3,8 +3,10 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+DEFAULT_AUTH_SALT = "dev-insecure-salt-change-me"
 
 
 class Settings(BaseSettings):
@@ -52,7 +54,10 @@ class Settings(BaseSettings):
     # OpenAI 兼容端点（如 DeepSeek 代理）：base_url 需含 /v1，走 /chat/completions
     openai_base_url: str = ""
     openai_api_key: str = ""
-    default_model: str = "claude-opus-4-8"
+    # 默认主模型。这里填的是**当前 provider 的模型 id**：走 Anthropic 填 claude-*，
+    # 走 OpenAI 兼容端点要覆盖成该端点的 id（如 deepseek-chat），否则请求会被对端
+    # 以「未知模型」拒掉。
+    default_model: str = "claude-opus-5"
     default_system_prompt: str = "你是 AgentGate，一个有帮助的 AI 助手。"
     # 全量摘要压缩用的低成本模型（plan/05 §7.3）；留空则复用主模型。
     summary_model: str = ""
@@ -61,8 +66,9 @@ class Settings(BaseSettings):
 
     # —— 认证/鉴权（plan/02）——
     # API Key 哈希盐（服务端机密，不入库）。生产必须设置，dev 留默认。
-    auth_salt: str = "dev-insecure-salt-change-me"
-    # 是否强制认证。dev 默认关闭，方便本地无 key 调试；生产应设 true。
+    auth_salt: str = DEFAULT_AUTH_SALT
+    # 是否强制认证。dev 默认关闭，方便本地无 key 调试；生产必须 true——
+    # 非 dev 环境下留 false 会被 _validate_prod_security 拒绝启动。
     auth_required: bool = False
 
     # —— 记忆 / 技能 / 提示词分层（plan/06、07、08）——
@@ -82,6 +88,28 @@ class Settings(BaseSettings):
 
     def fallback_model_list(self) -> list[str]:
         return [m.strip() for m in self.fallback_models.split(",") if m.strip()]
+
+    @model_validator(mode="after")
+    def _validate_prod_security(self) -> "Settings":
+        """非 dev 环境下拒绝以不安全的认证配置启动。
+
+        为什么是「拒绝启动」而不是「打个告警」：auth_required=False 时未带凭证的
+        请求会拿到一个匿名 Principal，而 /v1/admin/* 只靠 scope 把关。漏配一个环境
+        变量就等于把「签发任意租户 API Key」的接口挂到公网上——这种错误必须在部署
+        时就炸掉，而不是等日志里的一行 warning 被谁看见。
+        """
+        if self.app_env == "dev":
+            return self
+        problems: list[str] = []
+        if not self.auth_required:
+            problems.append("AUTH_REQUIRED must be true outside dev")
+        if self.auth_salt == DEFAULT_AUTH_SALT:
+            problems.append("AUTH_SALT must be changed from the shipped default")
+        if problems:
+            raise ValueError(
+                f"insecure configuration for APP_ENV={self.app_env}: " + "; ".join(problems)
+            )
+        return self
 
 
 @lru_cache

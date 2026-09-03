@@ -21,6 +21,12 @@ COMPACT_BUFFER = 13_000            # 自动压缩阈值缓冲（Claude Code 实�
 
 # 已知模型的上下文窗口（token）。未命中走 DEFAULT_CONTEXT_WINDOW。
 # 前缀匹配：键是模型名前缀，便于覆盖 deepseek-v4-pro / -flash / -pro-max 等变体。
+#
+# 这些是**保守的经验值**，不是实测值。新一代模型（Claude 5 家族等）有远大于 200k
+# 的窗口变体，这里故意不往上写：低估只会让压缩提前触发（多花一次摘要），高估会让
+# 预算检查放行一个必然 413 的请求，只能靠反应式压缩兜底。真正的修法是用 provider
+# 的模型元数据接口（Anthropic GET /v1/models/{id}）在启动时拉一次并缓存 —— 见
+# docs Roadmap，不在本轮范围内。
 _MODEL_WINDOWS: dict[str, int] = {
     "deepseek": 128_000,
     "claude-opus": 200_000,

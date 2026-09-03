@@ -19,7 +19,6 @@ from app.resilience.backoff import (
 )
 from app.resilience.circuit_breaker import (
     CircuitBreaker,
-    CircuitState,
     InMemoryCircuitStore,
 )
 from app.resilience.rate_limit import (

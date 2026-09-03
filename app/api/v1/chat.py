@@ -25,6 +25,7 @@ from app.config import get_settings
 from app.context.memory.recall import MemoryService
 from app.context.memory.store import DbMemoryStore
 from app.context.session_store import SessionStore
+from app.domain.enums import SessionState
 from app.domain.events import Event
 from app.domain.llm import ToolCall
 from app.domain.principal import Principal
@@ -94,8 +95,11 @@ class MessageResponse(BaseModel):
 
 
 class ConfirmationRequest(BaseModel):
-    tool_call_id: str
-    approved: bool
+    # 一次确认只针对一个调用（不隐式放行其余）。拒绝可以走 reject_all 一把清空。
+    tool_call_id: str | None = None
+    approved: bool = False
+    # 拒绝全部挂起调用：不想逐个拒时用它。与 approved=True 互斥（批准必须逐个来）。
+    reject_all: bool = False
 
 
 @router.post("/sessions", response_model=CreateSessionResponse)
@@ -181,19 +185,7 @@ async def _build_loop(
         },
     )
 
-    # —— 阶段 7：注入子 agent 执行体，并挂载 spawn_agent 工具（plan/03 §8、04 §8）——
-    # session_id 为 None（如果未来出现无 session 的调用路径）就不挂 spawn_agent。
-    if session_id is not None:
-        runner = SubagentRunner(
-            provider=provider,
-            registry=registry,
-            default_model=settings.default_model,
-            store=store,
-            parent_session_id=session_id,
-        )
-        attach_spawn_agent(registry, runner)
-
-    # —— 阶段 6：记忆 + 技能 + 提示词分层（按配置启用，缺则优雅降级）——
+    # —— 会话身份先取：子 agent 与记忆都要用（顺序有意义，见下）——
     external_user: str | None = None
     tenant_id: str | None = None
     if session_id is not None:
@@ -202,6 +194,27 @@ async def _build_loop(
             external_user = sess.external_user
             tenant_id = str(sess.tenant_id) if sess.tenant_id else None
 
+    # —— 阶段 7：注入子 agent 执行体，并挂载 spawn_agent 工具（plan/03 §8、04 §8）——
+    # session_id 为 None（如果未来出现无 session 的调用路径）就不挂 spawn_agent。
+    # tenant_id / granted_scopes 必须在这里就位——所以会话查询被提到了上面：
+    # 子 agent 的 ToolContext 少了这两样，就等于以「无主体」身份调工具，MCP 之类
+    # 需要 scope 的工具会被当成内部调用放行，成了绕过父权限的后门。
+    if session_id is not None:
+        runner = SubagentRunner(
+            provider=provider,
+            registry=registry,
+            default_model=settings.default_model,
+            parent_session_id=session_id,
+            tenant_id=tenant_id,
+            granted_scopes=granted_scopes,
+            # None = 注册表全集，与父这轮暴露给模型的集合一致：PromptComposer 只会
+            # 把技能工具**并集**进来，不会收窄。若哪天它开始收窄，这里要改成传入
+            # 父的实际 enabled_tools，否则子 agent 能点到父被收窄掉的工具。
+            parent_tools=None,
+        )
+        attach_spawn_agent(registry, runner)
+
+    # —— 阶段 6：记忆 + 技能 + 提示词分层（按配置启用，缺则优雅降级）——
     memory = MemoryService(DbMemoryStore(db)) if settings.memory_enabled else None
     composer = PromptComposer(
         PromptAssembler(agent_name=settings.agent_name, agent_role=settings.agent_role),
@@ -251,6 +264,35 @@ async def _ensure_session(
     authorize(principal, action, session.tenant_id)
 
 
+async def _guard_pending_confirmation(
+    db: AsyncSession, redis: Redis, session_id: uuid.UUID
+) -> None:
+    """挂起等待确认时拒收新消息（409），但过期的挂起要自愈而不是把会话锁死。
+
+    会话挂起后，已落库的 assistant.tool_use 还没有配对结果。此时若直接接受新
+    消息，投影会送出非法序列（详见 AgentLoop._close_pending_tool_calls）。所以：
+    - Redis 里挂起还在 → 409，引导客户端先走 /confirmations。
+    - 挂起已过期（TTL 1h）→ 状态置回 active，孤儿由 Loop 的自愈路径补配对，
+      本次请求正常继续。否则会话会永久停在 waiting_confirmation 上。
+    """
+    store = SessionStore(db)
+    session = await store.get_session(session_id)
+    if session is None or session.state != SessionState.waiting_confirmation:
+        return
+    if await _load_pending(redis, session_id) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="session is waiting for tool confirmation; "
+            "resolve it via POST /v1/sessions/{id}/confirmations",
+        )
+    log.warning("pending_confirmation_expired", session_id=str(session_id))
+    await store.set_state(session_id, SessionState.active)
+    # 立刻提交：流式路径的请求级 db 会话要等整段 SSE 结束才关闭，而后台运行任务
+    # 用的是另一个会话，append_event 会 SELECT ... FOR UPDATE 同一行会话记录 ——
+    # 不在这里释放行锁就会互等到超时。
+    await db.commit()
+
+
 @router.post("/sessions/{session_id}/messages", response_model=MessageResponse)
 async def post_message(
     session_id: uuid.UUID,
@@ -261,6 +303,7 @@ async def post_message(
 ) -> MessageResponse:
     """非流式：内部消费 Loop 事件流，聚合成一次性响应。"""
     await _ensure_session(db, session_id, principal, "sessions:write")
+    await _guard_pending_confirmation(db, redis, session_id)
     loop = await _build_loop(db, session_id, redis, granted_scopes=principal.scopes)
 
     try:
@@ -328,6 +371,7 @@ async def post_message_stream(
     不会中止运行——后台任务继续写缓冲，重连走 GET 同路径从断点续读。
     """
     await _ensure_session(db, session_id, principal, "sessions:write")
+    await _guard_pending_confirmation(db, redis, session_id)
 
     run_id = new_run_id()
     # scope 随任务带进后台：后台自带 DB 会话、脱离请求作用域，principal 不会
@@ -463,17 +507,32 @@ async def post_confirmation(
     """批准/拒绝 dangerous 工具后恢复 Loop（plan/04 §6）。
 
     批准 → 该 call 跳过确认关卡执行；拒绝 → 以"用户拒绝"结果回填，让 LLM 另作打算。
-    两种情况都恢复运行直到自然结束（或再次挂起）。
+    两种情况都恢复运行直到自然结束（或再次挂起）。reject_all=true 一次拒绝全部挂起
+    调用——给客户端一条「放弃这批工具、让会话继续」的干净出路。
     """
     await _ensure_session(db, session_id, principal, "sessions:write")
     pending = await _load_pending(redis, session_id)
     if pending is None:
         raise HTTPException(status_code=409, detail="no pending confirmation")
-    if body.tool_call_id not in {call.id for call in pending}:
-        raise HTTPException(status_code=409, detail="confirmation does not match pending call")
 
-    approved = {body.tool_call_id} if body.approved else set()
-    rejected = set() if body.approved else {body.tool_call_id}
+    if body.reject_all:
+        if body.approved:
+            raise HTTPException(
+                status_code=422, detail="reject_all cannot be combined with approved=true"
+            )
+        approved: set[str] = set()
+        rejected = {call.id for call in pending}
+    else:
+        if not body.tool_call_id:
+            raise HTTPException(
+                status_code=422, detail="tool_call_id is required unless reject_all is set"
+            )
+        if body.tool_call_id not in {call.id for call in pending}:
+            raise HTTPException(
+                status_code=409, detail="confirmation does not match pending call"
+            )
+        approved = {body.tool_call_id} if body.approved else set()
+        rejected = set() if body.approved else {body.tool_call_id}
     loop = await _build_loop(db, session_id, redis, granted_scopes=list(principal.scopes))
 
     try:
