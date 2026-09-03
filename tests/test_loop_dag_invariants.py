@@ -5,7 +5,7 @@
 1. `heal_orphan_tool_calls` —— 自愈。中断留下的孤儿 tool_use 必须在**写入新 user
    消息之前**被补上配对结果。投影是纯函数、每轮从 append-only 的 DAG 重建，所以
    一条非法序列不是「这次失败」，而是每一次都失败、且删不掉。
-2. `_apply_subagent_marker` —— 子 agent 审计留痕。必须是 is_sidechain（不能污染父
+2. `_apply_subagent_trace` —— 子 agent 审计留痕。必须是 is_sidechain（不能污染父
    上下文），必须是**一条**事件（start/end 两条的话，中间崩了就留一条悬空的 start）。
 
 这两条都只在异常路径上生效，正常跑一百遍也不会覆盖到——所以必须有测试。
@@ -16,8 +16,9 @@ import uuid
 from datetime import UTC, datetime
 
 from app.domain.enums import EventKind, Role, SessionState
-from app.domain.llm import ToolCall
+from app.domain.llm import ToolCall, Usage
 from app.domain.models import ContentBlock, Session, SessionEvent
+from app.domain.subagent import SUB_STOP_COMPLETED, SUB_STOP_ERROR, SubAgentTrace
 from app.orchestration.agent_loop import AgentLoop
 
 
@@ -169,7 +170,7 @@ async def test_close_pending_tool_calls_empty_is_noop():
 # —— 子 agent 审计留痕 ——
 
 
-async def test_subagent_marker_is_single_sidechain_event():
+async def test_subagent_trace_is_single_sidechain_event():
     sid = uuid.uuid4()
     store = _FakeStore(sid)
     await store.append_event(
@@ -178,15 +179,17 @@ async def test_subagent_marker_is_single_sidechain_event():
     )
     head_before = store.head
 
-    await _loop(store)._apply_subagent_marker(
+    await _loop(store)._apply_subagent_trace(
         sid,
         {
-            "agent_id": "sub-abc",
-            "task": "查一下 A",
-            "text": "结论是 B",
-            "turns": 2,
-            "ok": True,
-            "allowed_tools": ["kb_search"],
+            "trace": SubAgentTrace(
+                agent_id="sub-abc",
+                task="查一下 A",
+                result_digest="结论是 B",
+                turns=2,
+                stop_reason=SUB_STOP_COMPLETED,
+                usage=Usage(input_tokens=10, output_tokens=4),
+            ).model_dump(mode="json")
         },
     )
 
@@ -199,17 +202,25 @@ async def test_subagent_marker_is_single_sidechain_event():
     assert store.head == head_before
 
     text = ev.content[0].text or ""
-    assert "sub-abc" in text and "ok" in text
+    assert "sub-abc" in text and SUB_STOP_COMPLETED in text
     assert "查一下 A" in text and "结论是 B" in text
-    assert "kb_search" in text
 
 
-async def test_subagent_marker_records_failure():
+async def test_subagent_trace_records_failure():
     """失败也要留痕，而且要看得出是失败——排查时最需要的正是这一条。"""
     sid = uuid.uuid4()
     store = _FakeStore(sid)
-    await _loop(store)._apply_subagent_marker(
-        sid, {"agent_id": "sub-err", "task": "t", "text": "boom", "turns": 1, "ok": False}
+    await _loop(store)._apply_subagent_trace(
+        sid,
+        {
+            "trace": SubAgentTrace(
+                agent_id="sub-err",
+                task="t",
+                result_digest="boom",
+                turns=1,
+                stop_reason=SUB_STOP_ERROR,
+            ).model_dump(mode="json")
+        },
     )
     text = store.events[-1].content[0].text or ""
-    assert "failed" in text and "boom" in text
+    assert SUB_STOP_ERROR in text and "boom" in text

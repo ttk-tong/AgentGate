@@ -27,13 +27,16 @@ from app.context.context_builder import (
 from app.context.projection import find_orphan_tool_calls
 from app.context.session_store import SessionStore
 from app.domain.enums import EventKind, Role, SessionState
-from app.domain.errors import PromptTooLong, ProviderOverloaded, ProviderUnavailable
+from app.domain.errors import PromptTooLong, ProviderOverloaded
 from app.domain.events import Event
 from app.domain.llm import LLMRequest, ToolCall, Usage
 from app.domain.models import ContentBlock
+from app.domain.subagent import MUTATION_SUBAGENT_TRACE, SubAgentTrace
 from app.domain.tool import ContextMutation, ToolContext, ToolResult
 from app.observability.logging import get_logger, get_trace_id
 from app.observability.tracing import get_tracer, start_span
+from app.orchestration.fleet import FleetGovernor
+from app.orchestration.llm_call import stream_with_retry
 from app.orchestration.state import (
     STOP_COMPACT_FAILED,
     STOP_COMPLETED,
@@ -52,7 +55,6 @@ from app.orchestration.tool_executor import (
 )
 from app.orchestration.tools.base import ToolRegistry
 from app.routing.providers.base import Provider
-from app.resilience.retry import RetryPolicy, call_with_retry
 
 log = get_logger("agent_loop")
 tracer = get_tracer("agentgate.agent_loop")
@@ -87,6 +89,7 @@ class AgentLoop:
         tenant_id: str | None = None,
         circuit=None,
         granted_scopes: list[str] | None = None,
+        governor: FleetGovernor | None = None,
     ):
         self.store = store
         self.provider = provider
@@ -111,16 +114,26 @@ class AgentLoop:
         self.tenant_id = tenant_id
         self.circuit = circuit
         # 本次运行主体的 scope（来自 Principal）。工具层据此做权限判定——
-        # MCP 工具要求 mcp:{server}（见 app/mcp/proxy_tool）。空列表表示
-        # 「未注入」，工具层不二次设卡（dev 匿名调用与内部路径沿用此约定）。
+        # MCP 工具要求 mcp:{server}（见 app/mcp/proxy_tool）。空列表 +
+        # ToolContext.internal=False 会被默认拒绝；没有请求主体的内部路径
+        # 必须显式设 internal=True，不能再用「空 scope 放行」来表达。
         self.granted_scopes = list(granted_scopes or [])
+        # —— 阶段 8：委派树闸门（plan/12 §5.1）——
+        # 与 SubagentRunner 共享同一份：闸门必须是「一次 run 内全树共享」的，两份账等于没账。
+        # 为 None 时按配置自建——直接构造 AgentLoop 的调用方（测试、内部路径）不必关心它。
+        self.governor = governor or _default_governor()
 
     def _tool_context(self, session_id) -> ToolContext:
-        """构造工具执行上下文。集中一处，避免多个调用点漏传 scope。"""
+        """构造工具执行上下文。集中一处，避免多个调用点漏传 scope。
+
+        `agent_depth=0`：父 loop 是委派树的根。子 agent 的 ToolContext 由
+        `AgentRunContext.child()` 派生（见 orchestration/subagent），深度逐层 +1。
+        """
         return ToolContext(
             tenant_id=self.tenant_id or "",
             session_id=str(session_id),
             agent_id=self.model,
+            agent_depth=0,
             trace_id=get_trace_id() or "",
             granted_scopes=self.granted_scopes,
         )
@@ -191,35 +204,8 @@ class AgentLoop:
         return len(orphans)
 
     async def _stream_with_retry(self, request: LLMRequest) -> AsyncIterator:
-        """Retry only before emitting a provider chunk; emitted streams are not replayable."""
-        class _NoRetryOverload(Exception):
-            def __str__(self) -> str:
-                return "provider overloaded"
-
-        async def start(_provider: str, _model: str):
-            try:
-                stream = self.provider.stream(request)
-                return await anext(stream), stream
-            except ProviderOverloaded as exc:
-                # Preserve model fallback semantics; overload selects another model,
-                # while transport failures use the bounded retry policy.
-                raise _NoRetryOverload() from exc
-
-        try:
-            first, stream = await call_with_retry(
-                [(getattr(self.provider, "name", "configured"), request.model)],
-                start,
-                policy=RetryPolicy.foreground(),
-                sleep=asyncio.sleep,
-                now=time.monotonic,
-                circuit=self.circuit,
-            )
-        except ProviderUnavailable as exc:
-            if str(exc) == "provider overloaded":
-                raise ProviderOverloaded("provider overloaded") from exc
-            raise
-        yield first
-        async for chunk in stream:
+        """委托给 llm_call 的共享执行体（plan/12 §10.4）——父子 loop 同一条韧性链路。"""
+        async for chunk in stream_with_retry(self.provider, request, circuit=self.circuit):
             yield chunk
 
     async def run(self, session_id, user_text: str) -> AsyncIterator[Event]:
@@ -372,7 +358,12 @@ class AgentLoop:
             run_span.set_attribute("agent.turns", st.turn)
             run_span.set_attribute("agent.stop_reason", st.stop_reason or "")
             run_span.set_attribute("agent.tool_calls", st.tool_calls_made)
+            run_span.set_attribute("agent.subagents", st.subagents_spawned)
             run_span.end()
+            if st.subagents_spawned or self.governor.denials:
+                # 观测四问的收尾快照（plan/12 §10.3）：扇出几个、烧了多少、被拒几次
+                log.info("fleet_summary", session_id=str(session_id),
+                         **self.governor.snapshot())
 
     async def _drive_turns(
         self, session_id, st: LoopState, run_span
@@ -599,13 +590,30 @@ class AgentLoop:
                     "tool.names": ",".join(tc.name for tc in tool_calls),
                 },
             )
-            try:
-                results = await execute_batched(
+            # 子 agent 进展要在批**执行期间**流出去，否则一次 300 秒的 fan-out 在客户端
+            # 看来就是一段空白（plan/12 §10.2）。做法：把批跑成 task，边等边 drain 出口。
+            sink: asyncio.Queue[dict] = asyncio.Queue()
+            self.governor.event_sink = sink.put_nowait
+            exec_task = asyncio.create_task(
+                execute_batched(
                     tool_calls,
                     self.registry,
                     ctx,
                     apply_mutation=self._make_applier(session_id),
                 )
+            )
+            try:
+                while not exec_task.done():
+                    try:
+                        item = await asyncio.wait_for(sink.get(), timeout=0.05)
+                    except asyncio.TimeoutError:
+                        continue
+                    seq += 1
+                    yield Event.subagent(seq, **item)
+                while not sink.empty():
+                    seq += 1
+                    yield Event.subagent(seq, **sink.get_nowait())
+                results = await exec_task   # 异常在此原样冒泡，恢复分支语义不变
             except ConfirmationRequired as e:
                 tool_span.set_attribute("tool.confirmation_pending", e.call.name)
                 tool_span.end()
@@ -616,9 +624,18 @@ class AgentLoop:
                     e.call.id, e.call.name, e.call.arguments, e.reason, seq
                 )
                 raise ConfirmationPending(tool_calls, e.call, e.reason) from None
+            finally:
+                self.governor.event_sink = None
+                # 生成器被提前关闭（客户端断开等）时不留下脱管的后台批次——
+                # 改成 create_task 之前，GeneratorExit 会直接取消那个 await。
+                if not exec_task.done():
+                    exec_task.cancel()
             tool_span.end()
 
             st.tool_calls_made += len(tool_calls)
+            # 子 agent 的用量并进本次运行的总账。不做这一步，多 agent 的成本对调用方
+            # 完全不可见（阶段 7 实测：子烧 1234/567，父报告 0，plan/12 §4.5）。
+            self._absorb_subagent_usage(st, results)
 
             # —— 结果回填 DAG：一条 tool 消息承载所有结果块 ——
             result_blocks = [_result_block(tc, r) for tc, r in zip(tool_calls, results)]
@@ -723,44 +740,58 @@ class AgentLoop:
                 await self.store.append_note(session_id, mutation.payload.get("text", ""))
             elif mutation.kind == "remember":
                 await self._apply_remember(session_id, mutation.payload)
-            elif mutation.kind == "subagent_marker":
-                # 与 tools/builtin/spawn_agent.SUBAGENT_MARKER_KIND 对齐。这里写
-                # 字面量而不 import：agent_loop 不该为一个常量把 spawn_agent
-                # （→ subagent → tool_executor）拉进自己的导入图，其余 kind 也是
-                # 同样的字面量约定。
-                await self._apply_subagent_marker(session_id, mutation.payload)
+            elif mutation.kind == MUTATION_SUBAGENT_TRACE:
+                await self._apply_subagent_trace(session_id, mutation.payload)
             else:
                 log.warning("unknown_mutation", kind=mutation.kind)
 
         return apply
 
-    async def _apply_subagent_marker(self, session_id, payload: dict) -> None:
-        """子 agent 审计留痕：一条 is_sidechain 事件，记任务 + 最终结论。
+    async def _apply_subagent_trace(self, session_id, payload: dict) -> None:
+        """把整棵子 agent 委派树落成 sidechain 事件（plan/12 §10.1）。
 
-        `is_sidechain=True` 让它既不进父投影、也不改父 head（见 session_store
-        .append_event），所以对上下文完全透明——它只为「谁在什么时候派了什么活、
-        拿回了什么」这个审计问题存在。start/end 两条合成一条：派发那一刻还没有
-        结论，两条事件之间隔着整个子 loop，中间崩了就只剩一条悬空的 start。
+        为什么由父 loop 写而不是子 agent 自己写：fan-out 时 N 个子 agent 会并发使用同一个
+        `AsyncSession`（SQLAlchemy 明确不支持），而 executor 已经保证 mutation 在批末按
+        **模型原始调用顺序**串行应用——顺序确定，且全程只有一个 DB 写入者。
+
+        每个 agent 折成一条事件（start/end 合并）。不需要提前写 start：父的 assistant
+        `tool_use` 事件在批执行**之前**已落库，进程中途崩溃仍留有「尝试过派发」的痕迹。
         """
-        agent_id = str(payload.get("agent_id") or "unknown")
-        ok = bool(payload.get("ok", True))
-        text = str(payload.get("text") or "")
-        lines = [
-            f"[subagent:{agent_id}] {'ok' if ok else 'failed'}"
-            f" turns={payload.get('turns', 0)}"
-            f" tools={payload.get('allowed_tools') or []}",
-            f"task: {payload.get('task') or ''}",
-            f"result: {text}",
-        ]
-        await self.store.append_event(
-            session_id,
-            kind=EventKind.message,
-            role=Role.assistant,
-            content=[ContentBlock(type="text", text="\n".join(lines))],
-            is_sidechain=True,
-            agent_id_ref=agent_id,
+        raw = payload.get("trace")
+        if not raw:
+            return
+        try:
+            root = SubAgentTrace(**raw)
+        except Exception as e:  # noqa: BLE001  审计写入失败不该影响对话
+            log.warning("subagent_trace_invalid", session_id=str(session_id), error=str(e))
+            return
+        for node in root.flatten():
+            await self.store.append_event(
+                session_id,
+                kind=EventKind.message,
+                role=Role.assistant,
+                content=[ContentBlock(type="text", text=_trace_line(node))],
+                is_sidechain=True,      # 不改父 head、不进父投影（plan/05 §3）
+                agent_id_ref=node.agent_id,
+            )
+        log.info(
+            "subagent_trace_recorded",
+            session_id=str(session_id),
+            agents=len(root.flatten()),
+            tokens=root.total_usage().input_tokens + root.total_usage().output_tokens,
         )
-        log.info("subagent_marker_recorded", session_id=str(session_id), agent_id=agent_id, ok=ok)
+
+    def _absorb_subagent_usage(self, st: LoopState, results: list[ToolResult]) -> None:
+        """把子 agent 的用量并进本次运行的总账，并计数扇出规模。
+
+        `meta["usage"]` 由 spawn_agent 回填，含整棵子树，所以每个顶层派发只加一次。
+        """
+        for r in results:
+            usage = r.meta.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            st.usage = st.usage + Usage(**usage)
+            st.subagents_spawned += 1
 
     async def _apply_remember(self, session_id, payload: dict) -> None:
         """remember 工具的副作用：写入长期记忆（plan/06 §4.1）。
@@ -796,6 +827,31 @@ def _result_block(call: ToolCall, result: ToolResult) -> ContentBlock:
         tool_name=call.name,
         result=result.content,
         is_error=not result.ok,
+    )
+
+
+def _default_governor() -> FleetGovernor:
+    """按配置自建一份闸门。直接构造 AgentLoop 的调用方（测试/内部路径）不必关心委派治理。"""
+    from app.config import get_settings
+
+    s = get_settings()
+    return FleetGovernor.create(
+        token_budget=s.subagent_token_budget,
+        max_depth=s.subagent_max_depth,
+        max_spawns=s.subagent_max_per_run,
+        max_concurrency=s.subagent_max_concurrency,
+        enabled=s.subagent_enabled,
+    )
+
+
+def _trace_line(node: SubAgentTrace) -> str:
+    """一条子 agent 审计事件的正文。摘要而非全文——全文回父上下文正是委派要避免的事。"""
+    u = node.usage
+    return (
+        f"[subagent:{node.agent_id}] type={node.agent_type} depth={node.depth} "
+        f"stop={node.stop_reason} turns={node.turns} {node.duration_ms}ms "
+        f"tokens={u.input_tokens}+{u.output_tokens}\n"
+        f"task: {node.task}\nresult: {node.result_digest}"
     )
 
 

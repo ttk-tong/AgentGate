@@ -32,6 +32,7 @@ from app.domain.principal import Principal
 from app.mcp.manager import get_mcp_manager
 from app.observability.logging import get_logger, get_trace_id
 from app.orchestration.agent_loop import AgentLoop, ConfirmationPending
+from app.orchestration.fleet import FleetGovernor
 from app.orchestration.prompt.assembler import PromptAssembler
 from app.orchestration.prompt.composer import PromptComposer
 from app.orchestration.run_stream import (
@@ -185,7 +186,29 @@ async def _build_loop(
         },
     )
 
-    # —— 会话身份先取：子 agent 与记忆都要用（顺序有意义，见下）——
+    # —— 阶段 7/8：注入子 agent 执行体，并挂载 spawn_agent 工具（plan/03 §8、04 §8、12 §5）——
+    # session_id 为 None（如果未来出现无 session 的调用路径）就不挂 spawn_agent。
+    # 闸门（深度/扇出/预算/并发）在此创建一份，**同时给 runner 和 loop**——它必须是
+    # 「一次 run 内全树共享」的，两份账等于没账（plan/12 §5.1）。
+    circuit = CircuitBreaker(RedisCircuitStore(redis)) if redis is not None else None
+    governor = FleetGovernor.create(
+        token_budget=settings.subagent_token_budget,
+        max_depth=settings.subagent_max_depth,
+        max_spawns=settings.subagent_max_per_run,
+        max_concurrency=settings.subagent_max_concurrency,
+        enabled=settings.subagent_enabled,
+    )
+    if session_id is not None:
+        runner = SubagentRunner(
+            provider=provider,
+            registry=registry,
+            default_model=settings.default_model,
+            governor=governor,
+            circuit=circuit,
+        )
+        attach_spawn_agent(registry, runner)
+
+    # —— 阶段 6：记忆 + 技能 + 提示词分层（按配置启用，缺则优雅降级）——
     external_user: str | None = None
     tenant_id: str | None = None
     if session_id is not None:
@@ -193,28 +216,6 @@ async def _build_loop(
         if sess is not None:
             external_user = sess.external_user
             tenant_id = str(sess.tenant_id) if sess.tenant_id else None
-
-    # —— 阶段 7：注入子 agent 执行体，并挂载 spawn_agent 工具（plan/03 §8、04 §8）——
-    # session_id 为 None（如果未来出现无 session 的调用路径）就不挂 spawn_agent。
-    # tenant_id / granted_scopes 必须在这里就位——所以会话查询被提到了上面：
-    # 子 agent 的 ToolContext 少了这两样，就等于以「无主体」身份调工具，MCP 之类
-    # 需要 scope 的工具会被当成内部调用放行，成了绕过父权限的后门。
-    if session_id is not None:
-        runner = SubagentRunner(
-            provider=provider,
-            registry=registry,
-            default_model=settings.default_model,
-            parent_session_id=session_id,
-            tenant_id=tenant_id,
-            granted_scopes=granted_scopes,
-            # None = 注册表全集，与父这轮暴露给模型的集合一致：PromptComposer 只会
-            # 把技能工具**并集**进来，不会收窄。若哪天它开始收窄，这里要改成传入
-            # 父的实际 enabled_tools，否则子 agent 能点到父被收窄掉的工具。
-            parent_tools=None,
-        )
-        attach_spawn_agent(registry, runner)
-
-    # —— 阶段 6：记忆 + 技能 + 提示词分层（按配置启用，缺则优雅降级）——
     memory = MemoryService(DbMemoryStore(db)) if settings.memory_enabled else None
     composer = PromptComposer(
         PromptAssembler(agent_name=settings.agent_name, agent_role=settings.agent_role),
@@ -236,7 +237,8 @@ async def _build_loop(
         external_user=external_user,
         tenant_id=tenant_id,
         granted_scopes=granted_scopes,
-        circuit=CircuitBreaker(RedisCircuitStore(redis)) if redis is not None else None,
+        governor=governor,
+        circuit=circuit,
     )
 
 

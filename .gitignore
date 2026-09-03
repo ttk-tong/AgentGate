@@ -20,9 +20,8 @@ dist/
 .vscode/
 .DS_Store
 Thumbs.db
-
-# AI 助手的本机配置（settings.local.json 里可能有本机路径/权限白名单，不入库）
-.claude/
+# Claude Code 本地权限设置（每人一份，不入库；设计文档 .claude/plan/ 照常提交）
+.claude/settings.local.json
 
 # Logs
 *.log
