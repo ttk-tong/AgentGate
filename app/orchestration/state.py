@@ -11,7 +11,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-from app.domain.llm import Usage
+from app.domain.llm import ToolCall, Usage
 from app.domain.stop_reason import StopReason
 
 
@@ -74,3 +74,11 @@ class LoopState(BaseModel):
     consecutive_compact_failures: int = 0
     attempted_reactive_compact: bool = False
     model_fallbacks_used: int = 0
+    # —— 对话状态追踪：取消退出需要的两份跨层信息 ——
+    # 取消在 _drive_turns 里抛、在 _drive 里接，中间隔着一层生成器；这两个字段
+    # 就是那条缝里唯一能传值的通道。
+    # pending_tool_calls：已落库 tool_use、还没回填结果的调用。取消时必须按它补配对，
+    #   否则投影永久非法（见 agent_loop._close_pending_tool_calls）。
+    # last_seq：已发出的最大帧号。done 必须接着它编号，客户端才能按 seq 单调去重。
+    pending_tool_calls: list[ToolCall] = Field(default_factory=list)
+    last_seq: int = 0

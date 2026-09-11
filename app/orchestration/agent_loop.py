@@ -35,9 +35,16 @@ from app.domain.subagent import MUTATION_SUBAGENT_TRACE, SubAgentTrace
 from app.domain.tool import ContextMutation, ToolContext, ToolResult
 from app.observability.logging import get_logger, get_trace_id
 from app.observability.tracing import get_tracer, start_span
+from app.orchestration.cancel import (
+    NULL_CANCEL_TOKEN,
+    Cancelled,
+    CancelStore,
+    CancelToken,
+)
 from app.orchestration.fleet import FleetGovernor
 from app.orchestration.llm_call import stream_with_retry
 from app.orchestration.state import (
+    STOP_CANCELLED_BY_USER,
     STOP_COMPACT_FAILED,
     STOP_COMPLETED,
     STOP_MAX_TOOL_CALLS,
@@ -90,6 +97,7 @@ class AgentLoop:
         circuit=None,
         granted_scopes: list[str] | None = None,
         governor: FleetGovernor | None = None,
+        cancel_store: CancelStore | None = None,
     ):
         self.store = store
         self.provider = provider
@@ -122,6 +130,21 @@ class AgentLoop:
         # 与 SubagentRunner 共享同一份：闸门必须是「一次 run 内全树共享」的，两份账等于没账。
         # 为 None 时按配置自建——直接构造 AgentLoop 的调用方（测试、内部路径）不必关心它。
         self.governor = governor or _default_governor()
+        # —— 对话状态追踪：取消信号的读端（plan §P1）——
+        # 取消是跨进程的：写端是任意一个 worker 的 cancel 接口，读端是正在跑 run 的
+        # 那个 worker。所以信号必须走 Redis，不能是进程内变量。为 None（测试、内部
+        # 路径、非流式）时所有检查点退化成 no-op，行为与接入前完全一致。
+        self.cancel_store = cancel_store
+
+    def _cancel_token(self, run_id: str | None) -> CancelToken | None:
+        """按 run_id 造一个取消令牌。缺 store 或缺 run_id 都退化成永不取消。
+
+        令牌自带节流（默认 500ms），所以检查点可以放得很密——密的是本地时钟比较，
+        不是 Redis 往返。
+        """
+        if self.cancel_store is None or not run_id:
+            return NULL_CANCEL_TOKEN
+        return CancelToken(run_id, self.cancel_store)
 
     def _tool_context(self, session_id) -> ToolContext:
         """构造工具执行上下文。集中一处，避免多个调用点漏传 scope。
@@ -208,8 +231,14 @@ class AgentLoop:
         async for chunk in stream_with_retry(self.provider, request, circuit=self.circuit):
             yield chunk
 
-    async def run(self, session_id, user_text: str) -> AsyncIterator[Event]:
-        """驱动一次用户输入的完整运行，产出对外 Event 流。"""
+    async def run(
+        self, session_id, user_text: str, *, run_id: str | None = None
+    ) -> AsyncIterator[Event]:
+        """驱动一次用户输入的完整运行，产出对外 Event 流。
+
+        run_id 是取消/引导信号的寻址键。不传（非流式、内部路径）等于本次运行
+        不可取消——不是降级，是这条路径本来就没有可以被取消的窗口。
+        """
         # 自愈：上一次运行可能留下没配对的 tool_use（进程被杀、确认被放弃过期等）。
         # 必须在写 user 消息之前补，否则 tool 结果会排到 user 之后，依然非法。
         healed = await self.heal_orphan_tool_calls(session_id, "not_executed")
@@ -228,7 +257,7 @@ class AgentLoop:
             role=Role.user,
             content=[ContentBlock(type="text", text=user_text)],
         )
-        async for ev in self._drive(session_id):
+        async for ev in self._drive(session_id, run_id=run_id):
             yield ev
 
     async def _compose_prompt(self, session_id, user_text: str) -> None:
@@ -269,6 +298,7 @@ class AgentLoop:
         *,
         approved_ids: set[str],
         rejected_ids: set[str],
+        run_id: str | None = None,
     ) -> AsyncIterator[Event]:
         """人工确认后恢复：执行挂起的工具调用，回填结果，再继续主循环。
 
@@ -329,16 +359,17 @@ class AgentLoop:
             yield Event.tool_result(c.id, c.name, r.ok, r.display or r.content, seq)
 
         # 结果已回填在 head，继续主循环
-        async for ev in self._drive(session_id):
+        async for ev in self._drive(session_id, run_id=run_id):
             yield ev
 
-    async def _drive(self, session_id) -> AsyncIterator[Event]:
+    async def _drive(self, session_id, *, run_id: str | None = None) -> AsyncIterator[Event]:
         """主循环。假定新输入（user 消息或工具结果）已落库在 head。
 
         一次 run 一个根 span；PRE_CALL/LLM_CALL/TOOL_EXEC 各成子 span，
         在 Jaeger/Tempo 里呈现完整火焰图。app.trace_id 关联结构化日志。
         """
         st = LoopState(session_id=session_id, current_model=self.model)
+        token = self._cancel_token(run_id)
         run_span = start_span(
             tracer,
             "agent.run",
@@ -349,8 +380,39 @@ class AgentLoop:
             },
         )
         try:
-            async for ev in self._drive_turns(session_id, st, run_span):
+            async for ev in self._drive_turns(session_id, st, run_span, token):
                 yield ev
+        except Cancelled as e:
+            # —— 协作式取消的收尾。顺序在这里是语义的一部分，不能调 ——
+            # 1) 先补孤儿：st.pending_tool_calls 里是「已落库 tool_use、结果还没回填」
+            #    的调用。不补，下一轮投影就是非法消息序列，而投影是纯函数、每轮从
+            #    append-only DAG 重建 —— 那个 400 会永久复现，会话彻底报废。
+            # 2) 再发 done：done 是客户端的终止信号，它一落地读端就认为本轮已定型。
+            #    先 done 后补，等于给读端开了一个能看到非法中间态的窗口。
+            run_span.record_exception(e)
+            closed = await self._close_pending_tool_calls(
+                session_id, st.pending_tool_calls, e.reason or STOP_CANCELLED_BY_USER
+            )
+            if closed is not None:
+                st.head_event_id = closed
+            st.pending_tool_calls = []
+            st.phase = LoopPhase.aborted
+            st.status = "aborted"
+            st.stop_reason = e.reason or STOP_CANCELLED_BY_USER
+            log.info(
+                "run_cancelled",
+                session_id=str(session_id),
+                run_id=run_id or "",
+                stop_reason=st.stop_reason,
+                turn=st.turn,
+                closed_tool_calls=0 if closed is None else 1,
+            )
+            yield Event.done(
+                st.stop_reason,
+                str(st.head_event_id) if st.head_event_id else None,
+                st.usage.model_dump(),
+                st.last_seq + 1,
+            )
         except BaseException as e:
             run_span.record_exception(e)
             raise
@@ -366,13 +428,18 @@ class AgentLoop:
                          **self.governor.snapshot())
 
     async def _drive_turns(
-        self, session_id, st: LoopState, run_span
+        self, session_id, st: LoopState, run_span, token: CancelToken | None = None
     ) -> AsyncIterator[Event]:
         seq = 0
         deadline = time.monotonic() + self.cfg.wall_timeout_s
         tools_schema = self._tools_schema()
+        token = token or NULL_CANCEL_TOKEN
 
         while True:
+            # —— 检查点 1：轮次顶部。最便宜的取消点——还没花钱 ——
+            st.last_seq = seq
+            await token.raise_if_cancelled()
+
             # —— guard：轮次与墙钟 ——
             if st.turn >= self.cfg.max_turns:
                 yield _abort(st, STOP_MAX_TURNS, seq)
@@ -423,8 +490,17 @@ class AgentLoop:
                 tracer, "agent.llm_call", parent=run_span,
                 attributes={"agent.turn": st.turn, "llm.model": st.current_model},
             )
+            chunk_i = 0
             try:
                 async for chunk in self._stream_with_retry(request):
+                    # —— 检查点 2：流式产出中途 ——
+                    # 每 8 个 chunk 查一次。逐 chunk 查在语义上没错（令牌自带节流），
+                    # 但热路径上每个 token 都过一遍时钟比较没必要；8 个 chunk 的粒度
+                    # 对用户感知（几十毫秒）已经足够。
+                    chunk_i += 1
+                    if chunk_i % 8 == 0:
+                        st.last_seq = seq
+                        await token.raise_if_cancelled()
                     if chunk.type == "text" and chunk.text:
                         text_acc += chunk.text
                         emitted_any = True
@@ -436,6 +512,23 @@ class AgentLoop:
                         call_usage = chunk.usage
                     elif chunk.type == "finish":
                         finish_reason = chunk.finish_reason or "stop"
+            except Cancelled:
+                llm_span.end()
+                # 流中途被取消：已经吐给客户端的文本必须落库，否则历史与用户看到的
+                # 不一致（下一轮模型看不到自己说过的半句话）。这轮攒到的 tool_use
+                # **不落库**——不落就不存在孤儿，比落库再补一条 not_executed 干净。
+                st.last_seq = seq
+                if text_acc:
+                    st.head_event_id = await self.store.append_event(
+                        session_id,
+                        kind=EventKind.message,
+                        role=Role.assistant,
+                        content=[ContentBlock(type="text", text=text_acc)],
+                        message_id=str(uuid4()),
+                    )
+                st.usage.input_tokens += call_usage.input_tokens
+                st.usage.output_tokens += call_usage.output_tokens
+                raise
             except PromptTooLong as e:
                 llm_span.record_exception(e)
                 llm_span.end()
@@ -518,6 +611,10 @@ class AgentLoop:
                 message_id=message_id,
             )
             st.head_event_id = head_id
+            # tool_use 已经在库里了，从这一刻起它就是「待配对」的。取消一旦发生在
+            # 这之后、回填之前，_drive 的 except Cancelled 靠这个字段补配对。
+            st.pending_tool_calls = list(tool_calls)
+            st.last_seq = seq
 
             # —— max-output 恢复：被截断且未耗尽次数 → 升 max_tokens 后续写（plan/03 §4）——
             # 已落库的部分响应会进入下一轮投影，模型据此继续；带次数上限 guard。
@@ -528,6 +625,9 @@ class AgentLoop:
                 )
                 if closed is not None:
                     st.head_event_id = closed
+                # 已配对，不再是待配对。续写分支会回到轮次顶部的检查点 1——
+                # 那里若抛取消而这里没清，就会给同一批 tool_use 补第二条结果。
+                st.pending_tool_calls = []
                 if st.output_recovery_count < self.cfg.max_output_recovery:
                     st.output_recovery_count += 1
                     log.info(
@@ -556,6 +656,7 @@ class AgentLoop:
                 )
                 if closed is not None:
                     st.head_event_id = closed
+                st.pending_tool_calls = []
                 st.phase = LoopPhase.done
                 st.status = "done"
                 st.stop_reason = STOP_COMPLETED
@@ -572,6 +673,7 @@ class AgentLoop:
                 )
                 if closed is not None:
                     st.head_event_id = closed
+                st.pending_tool_calls = []
                 yield _abort(st, STOP_MAX_TOOL_CALLS, seq)
                 return
 
@@ -600,6 +702,7 @@ class AgentLoop:
                     self.registry,
                     ctx,
                     apply_mutation=self._make_applier(session_id),
+                    cancel_token=token,  # 检查点 3/4：批间 + 单工具前
                 )
             )
             try:
@@ -614,6 +717,16 @@ class AgentLoop:
                     seq += 1
                     yield Event.subagent(seq, **sink.get_nowait())
                 results = await exec_task   # 异常在此原样冒泡，恢复分支语义不变
+            except Cancelled:
+                tool_span.set_attribute("tool.cancelled", True)
+                tool_span.end()
+                # 批中途被取消：整批 tool_use 由 _drive 统一补 not_executed。
+                # 已经跑完的那几个工具，结果在这里丢掉了——副作用已发生但模型看不到
+                # 结果。这是协作式取消的既定代价（框架只承诺「不进入下一个检查点」），
+                # 换取的是「投影一定合法、会话一定能继续」。要更精确就得让
+                # execute_batched 返回部分结果，那是另一个契约，不在本期范围。
+                st.last_seq = seq
+                raise
             except ConfirmationRequired as e:
                 tool_span.set_attribute("tool.confirmation_pending", e.call.name)
                 tool_span.end()
@@ -645,9 +758,12 @@ class AgentLoop:
                 role=Role.tool,
                 content=result_blocks,
             )
+            # 结果已配对落库，这批不再是待配对的
+            st.pending_tool_calls = []
             for tc, r in zip(tool_calls, results):
                 seq += 1
                 yield Event.tool_result(tc.id, tc.name, r.ok, r.display or r.content, seq)
+            st.last_seq = seq
 
             # 回到顶部继续下一轮（needs_follow_up 隐含为真）
 
