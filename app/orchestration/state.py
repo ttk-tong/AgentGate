@@ -12,6 +12,7 @@ from uuid import UUID
 from pydantic import BaseModel, Field
 
 from app.domain.llm import Usage
+from app.domain.stop_reason import StopReason
 
 
 class LoopPhase(str, Enum):
@@ -27,16 +28,22 @@ class LoopPhase(str, Enum):
     aborted = "ABORTED"
 
 
-# 命名退出原因（plan/03 §2）。命名转移让每条路径可单测、可观测。
-STOP_COMPLETED = "completed"
-STOP_MAX_TURNS = "max_turns"
-STOP_MAX_TOOL_CALLS = "max_tool_calls"
-STOP_TIMEOUT = "timeout"
-STOP_PROMPT_TOO_LONG = "prompt_too_long"
-STOP_HOOK_STOPPED = "hook_stopped"
-STOP_ABORTED = "aborted"
-STOP_COMPACT_FAILED = "compact_failed"
-STOP_PROVIDER_UNAVAILABLE = "provider_unavailable"
+# 命名退出原因（plan/03 §2）。值就是对外协议字面量，由 StopReason 持有，
+# 这里只做导入别名——历史调用方（agent_loop / 测试）继续
+# `from app.orchestration.state import STOP_*`，一行不用改。
+STOP_COMPLETED = StopReason.COMPLETED.value
+STOP_MAX_TURNS = StopReason.MAX_TURNS.value
+STOP_MAX_TOOL_CALLS = StopReason.MAX_TOOL_CALLS.value
+STOP_TIMEOUT = StopReason.TIMEOUT.value
+STOP_PROMPT_TOO_LONG = StopReason.PROMPT_TOO_LONG.value
+STOP_HOOK_STOPPED = StopReason.HOOK_STOPPED.value
+STOP_ABORTED = StopReason.ABORTED.value
+STOP_COMPACT_FAILED = StopReason.COMPACT_FAILED.value
+STOP_PROVIDER_UNAVAILABLE = StopReason.PROVIDER_UNAVAILABLE.value
+# —— 对话状态追踪新增 ——
+STOP_CANCELLED_BY_USER = StopReason.CANCELLED_BY_USER.value
+STOP_SUPERSEDED = StopReason.SUPERSEDED.value
+STOP_WAITING_CONFIRMATION = StopReason.WAITING_CONFIRMATION.value
 
 
 class LoopConfig(BaseModel):

@@ -20,6 +20,7 @@ EventType = Literal[
     "error",
     "compact",
     "subagent",
+    "steered",
 ]
 
 
@@ -41,12 +42,43 @@ class Event(BaseModel):
         )
 
     @staticmethod
-    def done(stop_reason: str, head_event_id: str | None, usage: dict, seq: int) -> Event:
+    def done(
+        stop_reason: str,
+        head_event_id: str | None,
+        usage: dict,
+        seq: int,
+        retriable: bool | None = None,
+    ) -> Event:
+        """终止帧。
+
+        retriable 是**新增**字段（既有三个键一字不改）：客户端不必自己维护一张
+        「哪些 stop_reason 值得重试」的表——那张表必然与服务端漂移。
+        传 None 则按 StopReason 查表自动填；显式传值以传入为准。
+        """
+        from app.domain.stop_reason import is_retriable as _is_retriable
+
         return Event(
             type="done",
-            data={"stop_reason": stop_reason, "head_event_id": head_event_id, "usage": usage},
+            data={
+                "stop_reason": stop_reason,
+                "head_event_id": head_event_id,
+                "usage": usage,
+                "retriable": _is_retriable(stop_reason)
+                if retriable is None
+                else retriable,
+            },
             seq=seq,
         )
+
+    @staticmethod
+    def steered(text: str, mode: str, seq: int) -> Event:
+        """引导消息已被运行中的 loop 收下（对话状态追踪 P2）。
+
+        存在的理由是回执：用户在 run 进行中补了一句话，若没有这条事件，
+        客户端无法区分「已生效，模型下一轮会看到」与「发丢了」。
+        落库形态是一条普通 user 消息（不加装饰前缀），provenance 由本事件承载。
+        """
+        return Event(type="steered", data={"text": text, "mode": mode}, seq=seq)
 
     @staticmethod
     def error(
