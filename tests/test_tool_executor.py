@@ -21,6 +21,7 @@ from app.domain.tool import (
     ToolSpec,
 )
 from app.domain.llm import ToolCall
+from app.orchestration.cancel import Cancelled, CancelToken, InMemoryCancelStore
 from app.orchestration.tool_executor import (
     ConfirmationRequired,
     execute_batched,
@@ -201,3 +202,89 @@ async def test_unknown_tool_returns_error_result():
     results = await execute_batched(calls, reg, ToolContext())
     assert results[0].ok is False
     assert results[0].error_code == "unknown_tool"
+
+
+# —— 取消检查点（对话状态追踪 P1）——
+
+
+class _CountingTool(_FakeTool):
+    """记录自己被执行了几次，并可在每次执行后触发一个回调。
+
+    用来断言「取消后剩下的没跑」——只看抛不抛异常不够，必须看真实执行次数。
+    """
+
+    def __init__(self, spec: ToolSpec, *, after=None):
+        super().__init__(spec)
+        self.runs = 0
+        self._after = after
+
+    async def call(self, args, ctx, on_progress=None):
+        self.runs += 1
+        r = await super().call(args, ctx, on_progress=on_progress)
+        if self._after is not None:
+            await self._after()
+        return r
+
+
+async def test_cancel_before_batch_stops_all_tools():
+    tool = _CountingTool(_spec("counting", read_only=True, safe=False))
+    reg = _registry(tool)
+    store = InMemoryCancelStore()
+    await store.request_cancel("run1", "cancelled_by_user")
+    calls = [_call("counting", f"c{i}") for i in range(3)]
+
+    with pytest.raises(Cancelled):
+        await execute_batched(
+            calls, reg, ToolContext(),
+            cancel_token=CancelToken("run1", store),
+        )
+    assert tool.runs == 0, "批开始前就取消，一个都不该执行"
+
+
+async def test_cancel_midway_stops_remaining_tools():
+    """取消发生在第 1 个工具之后：剩下的不该再跑（逐个检查，不是整批）。"""
+    store = InMemoryCancelStore()
+
+    async def _cancel_now():
+        await store.request_cancel("run1", "cancelled_by_user")
+
+    tool = _CountingTool(
+        _spec("counting", read_only=True, safe=False), after=_cancel_now
+    )
+    reg = _registry(tool)
+    calls = [_call("counting", f"c{i}") for i in range(3)]
+    token = CancelToken("run1", store, poll_interval_s=0.0)  # 每个检查点都真查
+
+    with pytest.raises(Cancelled):
+        await execute_batched(calls, reg, ToolContext(), cancel_token=token)
+    assert tool.runs == 1, "第 1 个跑完后取消，第 2、3 个不该执行"
+
+
+async def test_cancel_checked_inside_concurrent_batch():
+    """并发批同样要逐个检查：一批只读工具，取消后剩下的不该再发出去。"""
+    store = InMemoryCancelStore()
+
+    async def _cancel_now():
+        await store.request_cancel("run1", "cancelled_by_user")
+
+    tool = _CountingTool(
+        _spec("reader", read_only=True, safe=True), after=_cancel_now
+    )
+    reg = _registry(tool)
+    calls = [_call("reader", f"c{i}") for i in range(6)]
+    token = CancelToken("run1", store, poll_interval_s=0.0)
+
+    with pytest.raises(Cancelled):
+        await execute_batched(calls, reg, ToolContext(), cancel_token=token)
+    # 并发批里已经进入信号量的会跑完，但不该 6 个全跑
+    assert tool.runs < 6
+
+
+async def test_no_token_behaves_as_before():
+    """既有调用方不传 token：行为完全不变。"""
+    tool = _CountingTool(_spec("counting", read_only=True, safe=False))
+    reg = _registry(tool)
+    calls = [_call("counting", f"c{i}") for i in range(2)]
+    results = await execute_batched(calls, reg, ToolContext())
+    assert [r.ok for r in results] == [True, True]
+    assert tool.runs == 2
