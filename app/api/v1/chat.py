@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import uuid
 from collections.abc import AsyncIterator
+from typing import Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import StreamingResponse
@@ -29,12 +31,26 @@ from app.domain.enums import SessionState
 from app.domain.events import Event
 from app.domain.llm import ToolCall
 from app.domain.principal import Principal
+from app.domain.reference import ContextReference, ReferenceError, ResolveScope
+from app.domain.stop_reason import StopReason
 from app.mcp.manager import get_mcp_manager
 from app.observability.logging import get_logger, get_trace_id
 from app.orchestration.agent_loop import AgentLoop, ConfirmationPending
+from app.orchestration.cancel import RedisCancelStore
+from app.orchestration.concurrency import (
+    DEFAULT_CONCURRENCY_POLICY,
+    IMPLEMENTED_POLICIES,
+    ConcurrencyPolicy,
+    preempt_active_run,
+)
 from app.orchestration.fleet import FleetGovernor
 from app.orchestration.prompt.assembler import PromptAssembler
 from app.orchestration.prompt.composer import PromptComposer
+from app.orchestration.references import (
+    attach_references,
+    build_default_resolvers,
+    resolve_all,
+)
 from app.orchestration.run_stream import (
     RunEventStream,
     new_run_id,
@@ -42,6 +58,7 @@ from app.orchestration.run_stream import (
 )
 from app.orchestration.session_lock import SessionBusyError, session_lock
 from app.orchestration.skills.registry import SkillRegistry
+from app.orchestration.steering import RedisSteeringQueue
 from app.orchestration.subagent import SubagentRunner
 from app.orchestration.tools import attach_spawn_agent, build_default_registry
 from app.persistence.db import get_db, get_sessionmaker
@@ -74,15 +91,27 @@ class CreateSessionRequest(BaseModel):
     # 客户内部的终端用户标识（B2B 模型 A）：仅用于会话归属/记忆隔离/审计，
     # 不参与鉴权——租户隔离由 tenant_id 硬校验保证。
     external_user: str | None = None
+    # double-texting 策略。None → 用默认（interrupt）。
+    concurrency_policy: ConcurrencyPolicy | None = None
 
 
 class CreateSessionResponse(BaseModel):
     session_id: uuid.UUID
     external_user: str | None = None
+    concurrency_policy: str = DEFAULT_CONCURRENCY_POLICY.value
+
+
+# 单条消息的引用条数上限。引用是用户手点出来的，个位数足够；
+# 不设限等于给出一条「一次请求塞进任意多份文档」的上下文放大路径。
+MAX_REFERENCES_PER_MESSAGE = 20
 
 
 class MessageRequest(BaseModel):
     content: str
+    # 引用（对话状态追踪 P3）。默认空列表 → 不带该字段的旧客户端行为完全不变。
+    references: list[ContextReference] = Field(
+        default_factory=list, max_length=MAX_REFERENCES_PER_MESSAGE
+    )
 
 
 class MessageResponse(BaseModel):
@@ -93,6 +122,8 @@ class MessageResponse(BaseModel):
     usage: dict
     # 本次运行调用过的工具（含入参与结果），便于观测「是否/如何调了工具」
     tool_calls: list[dict] = []
+    # 本次落库的引用快照事件 id：客户端据此回查"模型当时看到的是哪一版"
+    reference_ids: list[str] = []
 
 
 class ConfirmationRequest(BaseModel):
@@ -111,10 +142,25 @@ async def create_session(
 ) -> CreateSessionResponse:
     store = SessionStore(db)
     authorize(principal, "sessions:write")
+    policy = body.concurrency_policy or DEFAULT_CONCURRENCY_POLICY
+    if policy not in IMPLEMENTED_POLICIES:
+        # 明确 501 而不是静默降级：降级会让客户端以为消息排了队，
+        # 实际旧回复被丢弃——计费与对话完整性上都不可接受。
+        raise HTTPException(
+            status_code=501,
+            detail=f"concurrency_policy '{policy.value}' is not implemented yet; "
+            f"supported: {sorted(p.value for p in IMPLEMENTED_POLICIES)}",
+        )
     sid = await store.create_session(
         external_user=body.external_user, tenant_id=principal.tenant_id
     )
-    return CreateSessionResponse(session_id=sid, external_user=body.external_user)
+    if body.concurrency_policy is not None:
+        await store.set_concurrency_policy(sid, policy.value)
+    return CreateSessionResponse(
+        session_id=sid,
+        external_user=body.external_user,
+        concurrency_policy=policy.value,
+    )
 
 
 def _get_skill_registry() -> SkillRegistry | None:
@@ -239,6 +285,11 @@ async def _build_loop(
         granted_scopes=granted_scopes,
         governor=governor,
         circuit=circuit,
+        # 取消信号读端：多 worker 下 cancel 请求可能落在别的实例，必须走 Redis。
+        # redis 为 None（理论上的无 Redis 路径）时退化成不可取消。
+        cancel_store=RedisCancelStore(redis) if redis is not None else None,
+        # 引导队列读端：同理，多 worker 下必须共享存储。
+        steering=RedisSteeringQueue(redis) if redis is not None else None,
     )
 
 
@@ -295,6 +346,89 @@ async def _guard_pending_confirmation(
     await db.commit()
 
 
+# ReferenceError.code → HTTP 状态码。解析期错误都是客户端输入问题，
+# 不是服务端故障，所以全落 4xx。
+_REF_ERROR_STATUS = {
+    "not_found": 404,
+    "forbidden": 403,
+    "invalid_ref": 422,
+    "unsupported": 422,
+}
+
+
+async def _prepare_references(
+    db: AsyncSession, session_id: uuid.UUID, refs: list[ContextReference]
+):
+    """解析引用为快照。**只读**：不写 DAG，失败时零副作用。
+
+    刻意放在取会话锁之前：此时抛错能给出干净的 404/403/422，而 DAG 还没被碰过。
+    反过来（先落库再取锁）会在 409 session busy 时留下一批没有配对 user 消息的
+    snapshot 事件——它们不进投影，却会成为 head_event_id，让后续消息挂到一个
+    语义上不存在的父节点下。
+    """
+    if not refs:
+        return []
+    settings = get_settings()
+    store = SessionStore(db)
+    sess = await store.get_session(session_id)
+    resolvers = build_default_resolvers(
+        session_store=store,
+        memory_store=DbMemoryStore(db) if settings.memory_enabled else None,
+        # 沙箱根与 build_default_registry 保持一致（都用 cwd），
+        # 否则「引用读到的」与「file_read 读到的」会是两个不同的目录树。
+        file_base_dir=os.getcwd(),
+    )
+    scope = ResolveScope(
+        tenant_id=str(sess.tenant_id) if sess and sess.tenant_id else None,
+        session_id=str(session_id),
+        external_user=sess.external_user if sess else None,
+    )
+    try:
+        return await resolve_all(refs, resolvers, scope)
+    except ReferenceError as e:
+        raise HTTPException(
+            status_code=_REF_ERROR_STATUS.get(e.code, 422), detail=str(e)
+        ) from e
+
+
+async def _apply_concurrency_policy(
+    db: AsyncSession, redis: Redis, session_id: uuid.UUID
+) -> None:
+    """按会话策略处理"上一轮还在跑时又来了新消息"。
+
+    interrupt（默认）：取消旧 run 并等它放锁，然后本请求继续。
+    reject：什么都不做——后面取锁时自然 409（现状行为，一行不改）。
+    其余：501（契约占位，见 concurrency.py 顶部注释）。
+
+    注意与 _guard_pending_confirmation 的先后：**确认挂起优先**。挂起态下
+    Redis 里没有活跃 run（旧 run 已正常退出），抢占是空操作，但会话确实
+    不能收新消息——所以那条 409 必须先判。
+    """
+    policy = await SessionStore(db).get_concurrency_policy(session_id)
+    if policy == ConcurrencyPolicy.reject.value:
+        return
+    if policy != ConcurrencyPolicy.interrupt.value:
+        raise HTTPException(
+            status_code=501,
+            detail=f"concurrency_policy '{policy}' is not implemented yet",
+        )
+    try:
+        superseded = await preempt_active_run(redis, session_id)
+    except TimeoutError as e:
+        # 没能在预算内接手就诚实地 409，让客户端重试。硬闯锁会让两个 run
+        # 并发写同一条 DAG，父指针必错。
+        raise HTTPException(
+            status_code=409,
+            detail="previous run did not stop in time; retry shortly",
+        ) from e
+    if superseded:
+        log.info(
+            "double_texting.superseded",
+            session_id=str(session_id),
+            run_id=superseded,
+        )
+
+
 @router.post("/sessions/{session_id}/messages", response_model=MessageResponse)
 async def post_message(
     session_id: uuid.UUID,
@@ -306,15 +440,27 @@ async def post_message(
     """非流式：内部消费 Loop 事件流，聚合成一次性响应。"""
     await _ensure_session(db, session_id, principal, "sessions:write")
     await _guard_pending_confirmation(db, redis, session_id)
+    # double-texting：默认 interrupt——抢占旧 run 并等锁。放在确认挂起之后、
+    # 引用解析之前（挂起态优先；解析放抢占后，避免解析完却因抢占超时白做）。
+    await _apply_concurrency_policy(db, redis, session_id)
+    # 解析在取锁之前：失败就是干净的 4xx，DAG 未被触碰。
+    snapshots = await _prepare_references(db, session_id, body.references)
     loop = await _build_loop(db, session_id, redis, granted_scopes=principal.scopes)
 
+    ref_ids: list[uuid.UUID] = []
     try:
         async with session_lock(redis, session_id):
-            agg = await _consume(loop.run(session_id, body.content), redis, session_id)
+            # 落库 + 渲染放在锁内：此刻已确定这一轮真会跑。
+            content, ref_ids = await attach_references(
+                SessionStore(db), session_id, snapshots, body.content
+            )
+            agg = await _consume(loop.run(session_id, content), redis, session_id)
     except SessionBusyError:
         raise HTTPException(status_code=409, detail="session is busy") from None
 
-    return MessageResponse(session_id=session_id, **agg)
+    return MessageResponse(
+        session_id=session_id, reference_ids=[str(i) for i in ref_ids], **agg
+    )
 
 
 async def _consume(
@@ -374,11 +520,22 @@ async def post_message_stream(
     """
     await _ensure_session(db, session_id, principal, "sessions:write")
     await _guard_pending_confirmation(db, redis, session_id)
+    # double-texting：默认 interrupt——抢占旧 run 并等锁（与非流式路径同序）。
+    await _apply_concurrency_policy(db, redis, session_id)
+    # 引用解析留在请求作用域：这样错误还能变成 HTTP 状态码。
+    # 挪进后台任务就只能退化成流内 error 帧，客户端拿到 200 + 错误帧，重试难写。
+    snapshots = await _prepare_references(db, session_id, body.references)
 
     run_id = new_run_id()
     # scope 随任务带进后台：后台自带 DB 会话、脱离请求作用域，principal 不会
     # 自动传递，必须显式捕获——否则 MCP 工具的 scope 检查在流式路径下永远拿不到。
-    _spawn_run(session_id, body.content, run_id, granted_scopes=list(principal.scopes))
+    _spawn_run(
+        session_id,
+        body.content,
+        run_id,
+        granted_scopes=list(principal.scopes),
+        snapshots=snapshots,
+    )
     stream = RunEventStream(redis)
     return _stream_response(stream, session_id, run_id, after_seq=0)
 
@@ -416,22 +573,126 @@ async def resume_message_stream(
     return _stream_response(stream, session_id, run_id, after_seq=after_seq)
 
 
+class CancelResponse(BaseModel):
+    run_id: str
+    accepted: bool = True
+
+
+@router.post(
+    "/sessions/{session_id}/runs/{run_id}/cancel",
+    response_model=CancelResponse,
+    status_code=202,
+)
+async def cancel_run(
+    session_id: uuid.UUID,
+    run_id: str,
+    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+    principal: Principal = Depends(enforce_rate_limit),
+) -> CancelResponse:
+    """请求打断一次运行（对话状态追踪 P1）。
+
+    返回 202：取消是**协作式**的，这里只是把意图写进控制面，实际停止发生在运行
+    的下一个检查点。未知/已结束的 run 同样返回 202——客户端点停止时 run 可能刚好
+    自然结束，让它 404 会在 UI 上显示一个假错误。
+
+    多 worker 下这个请求可能落在任何实例上，所以信号写 Redis 而不是进程内。
+    """
+    await _ensure_session(db, session_id, principal, "sessions:write")
+    await RedisCancelStore(redis).request_cancel(
+        run_id, StopReason.CANCELLED_BY_USER.value
+    )
+    log.info("run_cancel_requested", session_id=str(session_id), run_id=run_id)
+    return CancelResponse(run_id=run_id)
+
+
+@router.post("/sessions/{session_id}/cancel", response_model=CancelResponse, status_code=202)
+async def cancel_current_run(
+    session_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+    principal: Principal = Depends(enforce_rate_limit),
+) -> CancelResponse:
+    """按会话取消最近一次运行。客户端不必自己记 run_id。
+
+    定位靠 `run:current:{session_id}`（由流式路径写入，见 run_stream.mark_current）。
+    定位不到就是真的没有可取消的运行，这里返回 404 是有信息量的。
+    """
+    await _ensure_session(db, session_id, principal, "sessions:write")
+    current = await RunEventStream(redis).get_current(session_id)
+    if current is None:
+        raise HTTPException(status_code=404, detail="no active run for session")
+    await RedisCancelStore(redis).request_cancel(
+        current, StopReason.CANCELLED_BY_USER.value
+    )
+    log.info("run_cancel_requested", session_id=str(session_id), run_id=current)
+    return CancelResponse(run_id=current)
+
+
+class SteerRequest(BaseModel):
+    text: str
+    mode: Literal["append", "urgent"] = "append"
+
+
+class SteerResponse(BaseModel):
+    run_id: str
+    queued: bool = True
+
+
+@router.post(
+    "/sessions/{session_id}/runs/{run_id}/steer",
+    response_model=SteerResponse,
+    status_code=202,
+)
+async def steer_run(
+    session_id: uuid.UUID,
+    run_id: str,
+    body: SteerRequest,
+    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+    principal: Principal = Depends(enforce_rate_limit),
+) -> SteerResponse:
+    """运行中引导：不终止 run，追加信息改变后续行为（对话状态追踪 P2）。
+
+    返回 202：引导在运行的下一个注入点（下一轮模型调用前，或当前工具批结束后）
+    生效，客户端会收到一个 `steered` 事件作为确认。
+
+    与取消一样，多 worker 下这个请求可能落在任何实例，所以写 Redis 队列。
+    """
+    await _ensure_session(db, session_id, principal, "sessions:write")
+    text = body.text.strip()
+    if not text:
+        # 空引导会在历史里留一条空 user 消息，污染后续每一轮上下文
+        raise HTTPException(status_code=422, detail="text must not be empty")
+    await RedisSteeringQueue(redis).push(run_id, text, mode=body.mode)
+    log.info("run_steer_queued", session_id=str(session_id), run_id=run_id)
+    return SteerResponse(run_id=run_id)
+
+
 # 后台运行任务的强引用集合（防止被 GC 提前回收）
 _RUN_TASKS: set[asyncio.Task] = set()
 
 
 def _spawn_run(
-    session_id: uuid.UUID, content: str, run_id: str, granted_scopes: list[str]
+    session_id: uuid.UUID,
+    content: str,
+    run_id: str,
+    granted_scopes: list[str],
+    snapshots: list | None = None,
 ) -> None:
     task = asyncio.create_task(
-        _run_to_stream(session_id, content, run_id, granted_scopes)
+        _run_to_stream(session_id, content, run_id, granted_scopes, snapshots or [])
     )
     _RUN_TASKS.add(task)
     task.add_done_callback(_RUN_TASKS.discard)
 
 
 async def _run_to_stream(
-    session_id: uuid.UUID, content: str, run_id: str, granted_scopes: list[str]
+    session_id: uuid.UUID,
+    content: str,
+    run_id: str,
+    granted_scopes: list[str],
+    snapshots: list | None = None,
 ) -> None:
     """后台执行一次运行，把每个 Event tee 进 Redis 运行缓冲。
 
@@ -457,8 +718,14 @@ async def _run_to_stream(
                     loop = await _build_loop(
                         db, session_id, redis, granted_scopes=granted_scopes
                     )
+                    # 快照落库用后台任务自己的 db 会话（请求作用域那个已随响应关闭）。
+                    # 必须在 loop.run 之前——快照事件要排在 user 消息之前，
+                    # 回放时才能重建"用户当时指到了什么"。
+                    content, _ref_ids = await attach_references(
+                        SessionStore(db), session_id, snapshots or [], content
+                    )
                     try:
-                        async for ev in loop.run(session_id, content):
+                        async for ev in loop.run(session_id, content, run_id=run_id):
                             if ev.type == "done":
                                 await db.commit()  # 先落库再发终止帧：读端见 done 时数据已可见
                             await _publish(ev)
