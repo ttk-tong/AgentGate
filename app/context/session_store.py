@@ -108,6 +108,16 @@ class SessionStore:
         row = await self.db.get(SessionRow, session_id)
         return _session_to_domain(row) if row else None
 
+    async def get_event(self, event_id: uuid.UUID) -> SessionEvent | None:
+        """按 id 单点取事件（引用解析用）。
+
+        故意不按 session 过滤——鉴权由调用方（ReferenceResolver）做，
+        这样它能区分「不存在」(404) 与「存在但不属于你」(403)；
+        若在此静默过滤，两者会坍缩成同一个 404，越权探测就无法审计。
+        """
+        row = await self.db.get(SessionEventRow, event_id)
+        return _to_domain(row) if row else None
+
     async def set_state(self, session_id: uuid.UUID, state: "SessionState") -> None:
         """更新会话状态（如挂起等待人工确认 waiting_confirmation，见 plan/04 §6）。"""
         sess = await self.db.get(SessionRow, session_id)
@@ -129,6 +139,38 @@ class SessionStore:
         notes = list(meta.get("notes", []))
         notes.append(text)
         meta["notes"] = notes
+        sess.meta = meta
+        await self.db.flush()
+
+    async def get_concurrency_policy(self, session_id: uuid.UUID) -> str:
+        """读会话的 double-texting 策略。缺失/非法值都回落到默认。
+
+        非法值不抛错：meta 是 JSONB，历史数据或外部写入都可能塞进意外字符串，
+        为此让一条正常消息 500 是不划算的。回落 + 告警是更诚实的处理。
+        """
+        from app.orchestration.concurrency import (
+            DEFAULT_CONCURRENCY_POLICY,
+            ConcurrencyPolicy,
+        )
+
+        sess = await self.db.get(SessionRow, session_id)
+        raw = (sess.meta or {}).get("concurrency_policy") if sess else None
+        if raw is None:
+            return DEFAULT_CONCURRENCY_POLICY.value
+        try:
+            return ConcurrencyPolicy(raw).value
+        except ValueError:
+            return DEFAULT_CONCURRENCY_POLICY.value
+
+    async def set_concurrency_policy(
+        self, session_id: uuid.UUID, policy: str
+    ) -> None:
+        """写会话的 double-texting 策略到 meta（无迁移）。"""
+        sess = await self.db.get(SessionRow, session_id)
+        if sess is None:
+            raise ValueError(f"session not found: {session_id}")
+        meta = dict(sess.meta or {})
+        meta["concurrency_policy"] = policy
         sess.meta = meta
         await self.db.flush()
 

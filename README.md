@@ -331,6 +331,30 @@ tests/              # 离线单测 + 端到端
 
 </details>
 
+<details>
+<summary><b>对话状态追踪：打断 / 引导 / 引用 / double-texting</b></summary>
+
+设计见 [`docs/superpowers/specs/2026-09-10-conversation-state-tracking-design.md`](docs/superpowers/specs/2026-09-10-conversation-state-tracking-design.md)。控制面全走 Redis（多 worker 下 cancel/steer 请求可能落在任意实例）。
+
+| 端点 | 说明 |
+|---|---|
+| `POST /v1/sessions/{id}/runs/{run_id}/cancel` | 取消指定运行（202，协作式） |
+| `POST /v1/sessions/{id}/cancel` | 取消该会话当前运行（202） |
+| `POST /v1/sessions/{id}/runs/{run_id}/steer` | 向进行中的运行追加引导消息（202） |
+
+消息请求（`POST /v1/sessions/{id}/messages[/stream]`）新增可选字段：
+
+- `references`: `[{"ref_type": "file|message|memory|kb", "ref_uri": "...", "render_mode": "inline|summary"}]`
+  最多 20 条。解析失败返回 404/403/422，不会写入会话（解析在锁外、落库在锁内，失败零副作用）。
+
+创建会话（`POST /v1/sessions`）新增可选字段：
+
+- `concurrency_policy`: `interrupt`（默认）| `reject`。`enqueue` / `rollback` 暂返回 501（不静默降级）。
+
+取消是**协作式**的：框架保证「不会进入下一个检查点」，不保证「立刻停下正在做的事」。已发出的 provider 请求与已启动的工具调用会跑完当前步骤。`done` 帧的 `stop_reason` 据此区分 `cancelled_by_user`（用户按停止）与 `superseded`（被新消息顶掉）。
+
+</details>
+
 ## License
 
 [MIT](LICENSE)

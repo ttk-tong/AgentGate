@@ -5,7 +5,8 @@
 - POST 一句话，非流式返回模型回复
 - 事件落库成 DAG（user → assistant 链）
 - SSE 流式返回 token 与 done
-- 会话串行锁生效（同一会话并发第二个请求返回 409）
+- 会话并发：默认策略 interrupt（抢占旧运行）；显式 reject 的会话返回 409
+  （见 tests/test_double_texting.py）
 
 前置：docker compose up -d，且已 alembic upgrade head。
 """

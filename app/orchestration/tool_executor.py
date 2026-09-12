@@ -26,6 +26,7 @@ from app.domain.tool import (
     ToolResult,
 )
 from app.observability.logging import get_logger
+from app.orchestration.cancel import NULL_CANCEL_TOKEN
 from app.orchestration.tools.base import ToolRegistry
 
 log = get_logger("tool_executor")
@@ -90,6 +91,7 @@ async def execute_batched(
     apply_mutation: MutationApplier | None = None,
     on_progress=None,
     pre_approved: set[str] | None = None,
+    cancel_token=None,
 ) -> list[ToolResult]:
     """按批执行工具调用，结果按原始顺序返回。
 
@@ -97,18 +99,30 @@ async def execute_batched(
     串行应用；串行批逐个立即应用。为 None 时不应用（仅收集在 result.mutation 里）。
     pre_approved：已通过人工确认的 call id 集合，对这些调用跳过 needs_confirmation
     检查（用于确认后恢复执行，见 plan/04 §6）。
+
+    cancel_token：协作式取消令牌（对话状态追踪 P1）。每批开始前 + 批内每个调用前
+    检查。**逐个检查而不是只查整批**——一批 10 个工具，用户在第 3 个跑完时取消，
+    剩下 7 个不该再烧钱。为 None 时用永不取消哨兵，既有调用方行为不变。
+
+    Cancelled 异常**原样冒泡**给 Loop：Loop 要先补写孤儿 tool_result 再收尾，
+    这一层若把它吞成一个失败结果，DAG 里就会留下没配对的 tool_use。
     """
     results: dict[str, ToolResult] = {}
     approved = pre_approved or set()
+    token = cancel_token or NULL_CANCEL_TOKEN
 
     for batch in partition_tool_calls(calls, registry):
+        # 检查点 3：每批开始前。批之间是天然的停顿点，代价最低。
+        await token.raise_if_cancelled()
         if batch.concurrency_safe and len(batch.calls) > 1:
             await _run_concurrent_batch(
-                batch, registry, ctx, results, apply_mutation, on_progress, approved
+                batch, registry, ctx, results, apply_mutation, on_progress, approved,
+                token,
             )
         else:
             await _run_serial_batch(
-                batch, registry, ctx, results, apply_mutation, on_progress, approved
+                batch, registry, ctx, results, apply_mutation, on_progress, approved,
+                token,
             )
 
     # 按模型原始调用顺序回填
@@ -123,12 +137,17 @@ async def _run_concurrent_batch(
     apply_mutation: MutationApplier | None,
     on_progress,
     approved: set[str],
+    token=NULL_CANCEL_TOKEN,
 ) -> None:
     """可并发批：并行执行，副作用先收集，批结束后按调用顺序串行应用。"""
     sem = asyncio.Semaphore(MAX_TOOL_CONCURRENCY)
 
     async def one(call: ToolCall) -> ToolResult:
         async with sem:
+            # 检查点 4：拿到信号量之后、真正调用之前。
+            # 放在 sem 之内而不是之外——批大于并发上限时，排在后面的协程会在这里
+            # 等待，取消发生在等待期间的话它们根本不该再发出去。
+            await token.raise_if_cancelled()
             return await run_single(
                 call, registry, ctx, on_progress, call.id in approved
             )
@@ -153,9 +172,12 @@ async def _run_serial_batch(
     apply_mutation: MutationApplier | None,
     on_progress,
     approved: set[str],
+    token=NULL_CANCEL_TOKEN,
 ) -> None:
     """串行批：逐个执行，副作用立即应用。"""
     for call in batch.calls:
+        # 检查点 4：每个调用前。串行批常是写工具，逐个拦住的价值最大。
+        await token.raise_if_cancelled()
         r = await run_single(call, registry, ctx, on_progress, call.id in approved)
         results[call.id] = r
         if apply_mutation is not None and r.mutation is not None:

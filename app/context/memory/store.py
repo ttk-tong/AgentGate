@@ -25,6 +25,7 @@ from app.persistence.tables import MemoryItemRow
 
 class MemoryStore(Protocol):
     async def insert(self, item: MemoryItem) -> str: ...
+    async def get_by_id(self, item_id: str) -> MemoryItem | None: ...
     async def update_content(self, item_id: str, content: str, importance: float) -> None: ...
     async def bump_importance(self, item_id: str, delta: float) -> None: ...
     async def mark_used(self, item_ids: list[str], *, now) -> None: ...
@@ -50,6 +51,11 @@ class InMemoryMemoryStore:
     async def insert(self, item: MemoryItem) -> str:
         self._items[str(item.id)] = item
         return str(item.id)
+
+    async def get_by_id(self, item_id: str) -> MemoryItem | None:
+        # 刻意不带 tenant 过滤：resolver 需要区分「不存在」(404) 与「跨租户禁止」(403)，
+        # 若在这里就按租户过滤掉，两种情况会坍缩成同一个 None。授权判定放在 resolver。
+        return self._items.get(item_id)
 
     async def update_content(self, item_id: str, content: str, importance: float) -> None:
         it = self._items.get(item_id)
@@ -121,6 +127,16 @@ class DbMemoryStore:
         self.db.add(row)
         await self.db.flush()
         return str(row.id)
+
+    async def get_by_id(self, item_id: str) -> MemoryItem | None:
+        # 见 InMemoryMemoryStore.get_by_id：刻意不带 tenant 过滤，授权判定在 resolver。
+        # id 非法 UUID 视作不存在（返回 None），不向上抛 ValueError。
+        try:
+            pk = uuid.UUID(item_id)
+        except (ValueError, AttributeError, TypeError):
+            return None
+        row = await self.db.get(MemoryItemRow, pk)
+        return _to_domain(row) if row is not None else None
 
     async def update_content(self, item_id: str, content: str, importance: float) -> None:
         row = await self.db.get(MemoryItemRow, uuid.UUID(item_id))
