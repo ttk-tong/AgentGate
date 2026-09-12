@@ -98,6 +98,7 @@ class AgentLoop:
         granted_scopes: list[str] | None = None,
         governor: FleetGovernor | None = None,
         cancel_store: CancelStore | None = None,
+        steering=None,
     ):
         self.store = store
         self.provider = provider
@@ -135,6 +136,41 @@ class AgentLoop:
         # 那个 worker。所以信号必须走 Redis，不能是进程内变量。为 None（测试、内部
         # 路径、非流式）时所有检查点退化成 no-op，行为与接入前完全一致。
         self.cancel_store = cancel_store
+        # —— 对话状态追踪 P2：引导队列（多 worker 下必须是 Redis 实现）——
+        self.steering = steering
+
+    async def _drain_steering(self, session_id, run_id: str | None, seq: int):
+        """取出待注入引导，落库成 user 消息，产出 steered 事件。
+
+        返回 (新 seq, 事件列表)。**必须落库**——只放进 messages 不落库的话，
+        resume 后引导丢失，agent 行为回退到引导前。
+
+        为什么以原文落库、不加「[用户补充]」这类装饰：这条消息在历史里与用户
+        正常输入同权，加前缀会让后续每一轮都带上一段元信息噪音，也会让压缩/
+        摘要把装饰当内容。要区分来源，用事件（Event.steered）而不是改正文。
+        """
+        if run_id is None or self.steering is None:
+            return seq, []
+        pending = await self.steering.drain(run_id)
+        if not pending:
+            return seq, []
+        events: list[Event] = []
+        for msg in pending:
+            await self.store.append_event(
+                session_id,
+                kind=EventKind.message,
+                role=Role.user,
+                content=[ContentBlock(type="text", text=msg.text)],
+            )
+            seq += 1
+            events.append(Event.steered(msg.text, msg.mode, seq))
+        log.info(
+            "run_steered",
+            session_id=str(session_id),
+            run_id=run_id,
+            count=len(pending),
+        )
+        return seq, events
 
     def _cancel_token(self, run_id: str | None) -> CancelToken | None:
         """按 run_id 造一个取消令牌。缺 store 或缺 run_id 都退化成永不取消。
@@ -380,7 +416,7 @@ class AgentLoop:
             },
         )
         try:
-            async for ev in self._drive_turns(session_id, st, run_span, token):
+            async for ev in self._drive_turns(session_id, st, run_span, token, run_id):
                 yield ev
         except Cancelled as e:
             # —— 协作式取消的收尾。顺序在这里是语义的一部分，不能调 ——
@@ -428,7 +464,8 @@ class AgentLoop:
                          **self.governor.snapshot())
 
     async def _drive_turns(
-        self, session_id, st: LoopState, run_span, token: CancelToken | None = None
+        self, session_id, st: LoopState, run_span, token: CancelToken | None = None,
+        run_id: str | None = None,
     ) -> AsyncIterator[Event]:
         seq = 0
         deadline = time.monotonic() + self.cfg.wall_timeout_s
@@ -439,6 +476,12 @@ class AgentLoop:
             # —— 检查点 1：轮次顶部。最便宜的取消点——还没花钱 ——
             st.last_seq = seq
             await token.raise_if_cancelled()
+
+            # —— 方案 A：下一次模型调用前 drain 引导。放在投影加载之前，
+            # 这样本轮 PRE_CALL 的投影就已经包含引导（用户可能上一轮就发了话）——
+            seq, steer_events = await self._drain_steering(session_id, run_id, seq)
+            for ev in steer_events:
+                yield ev
 
             # —— guard：轮次与墙钟 ——
             if st.turn >= self.cfg.max_turns:
@@ -763,6 +806,13 @@ class AgentLoop:
             for tc, r in zip(tool_calls, results):
                 seq += 1
                 yield Event.tool_result(tc.id, tc.name, r.ok, r.display or r.content, seq)
+            st.last_seq = seq
+
+            # —— 方案 B：工具批执行完立刻 drain。与方案 A 的区别只是时机——用户在
+            # 工具跑的那几十秒里说的话，不必等下一轮顶部才被看见 ——
+            seq, steer_events = await self._drain_steering(session_id, run_id, seq)
+            for ev in steer_events:
+                yield ev
             st.last_seq = seq
 
             # 回到顶部继续下一轮（needs_follow_up 隐含为真）
