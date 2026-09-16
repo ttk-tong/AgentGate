@@ -1,0 +1,55 @@
+id: D2-T01
+dimension: compact
+layer: twist
+title: 超阈值触发 microcompact：回收旧工具结果、不动父指针
+path: messages/stream
+
+# 铺垫一轮，但让这一轮内部连调 8 次 kb_search（compact.tool_turns=8）。
+# 为什么不是「8 条铺垫消息各调一次」：MockProvider 的收尾判据是「本次请求的**投影里**
+# 已经有工具结果」，不是「本轮已经有」——所以一个会话里只有第一条消息会真的调工具，
+# 后面 7 条全是空转（实测：8 条铺垫只产出 1 个工具结果事件）。
+#
+# 为什么要 8 次：plan_microcompact 保留最近 KEEP_RECENT=5 个结果不回收，主链上
+# 至少要 6 个工具结果事件才有可回收项。8 → 回收 3，断言留余量；写成正好 6 的话，
+# 产品把 KEEP_RECENT 调到 6 这题就变成假红。
+# kb_search 在 COMPACTABLE_TOOLS 白名单里（只读、可重新获取），weather 不在——
+# 选它是为了让选层逻辑走到 microcompact 这一侧。
+preamble:
+  - "查一下循环 [[tool:kb_search query=loop]]"
+
+compact:
+  tool_turns: 8
+  # Mock 的上下文窗口是 200k，默认阈值灌不到（见 CompactCfg）。把阈值压到必然超的
+  # 水位，让「压缩触发」成为可控前提；选哪一层、怎么改事件仍然是产品代码。
+  # 补丁只在被测这一轮生效，铺垫轮跑在真实阈值上（否则铺垫期就把历史切了）。
+  threshold_tokens: 100
+
+input:
+  content: "把前面查到的东西讲一下"
+
+expect:
+  http_status: 200
+  stop_reason: completed
+  # 选层：有可回收工具结果 → 必须走最轻的一层。只断言「压缩发生了」的话，
+  # 选层反了（直接上全量摘要，白白丢历史、废掉缓存前缀）也是绿的。
+  compact_layer: microcompact
+  # 真的回收了内容，而不只是压缩函数报了个 freed_tokens。
+  reclaimed_results_min: 3
+  # microcompact 的语义承诺：只改工具结果 content，不重排父指针。
+  # 重排父指针 = prompt cache 前缀失效，那就把「最省的一层」变成了最贵的一层。
+  parents_unchanged: true
+  # 轻层不该产出边界事件。产出了说明它悄悄升级成了全量摘要。
+  event_kind_counts:
+    compact_boundary: 0
+
+note: >-
+  设计 §D2-T01。三条断言各钉一件事：compact_layer 钉选层，reclaimed_results_min
+  钉「真回收」，parents_unchanged 钉「不动缓存前缀」。
+  阈值靠 compact.threshold_tokens 改装而非灌消息——Mock 窗口 200k，靠发消息撞默认
+  阈值要几百轮，还会把评测跑成分钟级。改装的只是触发条件，被测对象（KEEP_RECENT
+  保留窗口、replace_event_content 的就地改写、选层判断）全是产品代码。
+  已知边界二则：(1) 回收后的占位符仍是 tool_result 块、tool_call_id 不变，所以
+  no_orphan_tool_use 照常成立——这正是「microcompact 语义可逆」的一部分。
+  (2) MockProvider 每轮的 tool_call_id 都是 mockcall_0（批内下标），跨轮重复；
+  真实 provider 会给唯一 id。这里不影响被测量（回收按事件与内容判定），但非流式
+  响应体的 tool_calls 聚合会因此把 8 次并成 1 条——本题走流式路径，且不断言 tools。

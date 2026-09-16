@@ -1,0 +1,21 @@
+id: D1-B04
+dimension: tools
+layer: basic
+title: 沙箱内相对路径可读
+note: |
+  沙箱根是 os.getcwd()（chat.py 与 build_default_registry 都用 cwd），所以路径
+  写成相对仓库根。评测必须从仓库根启动，否则这题会以 not_found 红——这是正确的
+  失败，不要靠绝对路径绕过。
+path: messages
+input:
+  content: "[[tool:file_read path=evals/fixtures/sandbox/hello.txt]]"
+expect:
+  http_status: 200
+  stop_reason: completed
+  tools:
+    - name: file_read
+      arguments: {path: evals/fixtures/sandbox/hello.txt}
+      ok: true
+      result_contains: ["AGENTGATE_EVAL_FIXTURE_OK"]
+  max_tool_calls: 1
+  projection_len: 4

@@ -1,0 +1,68 @@
+id: D2-H01
+dimension: compact
+layer: hard
+title: 压缩连续失败到熔断：compact_failed 不可重试、不死循环
+path: messages/stream
+
+# 铺垫只为把主链撑到「够得上摘要」的长度：auto_compact 在 chain <= KEEP_TAIL+1 时
+# 直接返回 0，根本不会调摘要模型，也就攒不出失败。纯文本，不调工具。
+preamble:
+  - "我们要迁移一批历史订单。"
+  - "源库是 MySQL，目标是 Postgres。"
+  - "主键沿用原 id，不要重新生成。"
+  - "先跑一遍试运行，不写目标库。"
+
+compact:
+  # 阈值压到每一轮都超 → 每一轮都进压缩。
+  threshold_tokens: 100
+  # 摘要模型必失败 → CompactionError → consecutive_compact_failures 累加。
+  # 走的是产品真实的失败路径（compactor._summarize 把异常裹成 CompactionError）。
+  fail_summarizer: true
+  # 熔断阈值是 max_compact_failures=3，也就是要**同一个 run 里连续失败 3 次**。
+  # MockProvider 原生一个 run 最多 2 轮（见 provider.py），撑不到 3 次；tool_turns
+  # 让它连续几轮都产出工具调用，把 run 拉够长。4 > 3：第 3 轮就该熔断，第 4 轮
+  # 不该发生——若产品没熔断而是继续跑，题会以 stop_reason 不符变红。
+  tool_turns: 4
+
+# weather 刻意不在 COMPACTABLE_TOOLS 白名单里 → 每一轮 plan_microcompact 都是空
+# → 选层必然落到 auto_compact → 必然撞上失败的摘要模型。用 kb_search 的话前几轮
+# 会被 microcompact 成功消化掉，攒不到连续失败。
+input:
+  content: "查下天气 [[tool:weather city=北京]]"
+
+expect:
+  http_status: 200
+  # 熔断的对外表现：命名退出而不是 500，也不是无限重试。
+  stop_reason: compact_failed
+  # 上下文已不可恢复，重试只会再撞一次同样的失败。客户端按这个字段决定要不要重试，
+  # 值错了就会对不可恢复的失败死循环重试。
+  retriable: false
+  # 压缩全失败 → 一个边界都不该落库（失败的摘要不能留半个边界）。
+  event_kind_counts:
+    compact_boundary: 0
+  # 「不死循环」的可测形式：熔断发生在第 3 轮，工具最多只跑了前两轮各一次。
+  # 没有熔断而是每轮都试压缩的话，这个数会一路涨到 max_turns 才停。
+  max_tool_calls: 2
+
+# 熔断之后会话不能是废的。收尾轮跑在真实阈值上（补丁只包被测那一轮），
+# 不会再触发压缩，应当正常完成。
+followup:
+  content: "那先不迁了"
+  http_status: 200
+  stop_reason: completed
+
+note: >-
+  设计 §D2-H01。三条断言：stop_reason 钉命名退出，retriable=false 钉客户端语义，
+  max_tool_calls=2 钉「熔断真的止住了循环」。
+  失败注入用具名开关 compact.fail_summarizer，而不是「往历史里塞 [[tool:]] 字面量
+  把摘要挤成空串」那种巧劲——后者也能触发 CompactionError（D2-T01 的反证实验里
+  就撞到过），但读者无法从题本看出它在测什么。
+  已知产品缺口（**本题当前因此为红**，2026-09-16 实测）：熔断路径上
+  _pre_call_compact 是在 `yield ... , True` 之后由调用方 return 退出的，异步生成器的
+  finally（agent_loop.py:872 的 set_active_compaction(None)）不会在那一刻同步执行，
+  而是等 GC 回收生成器时才跑——那时请求作用域的 DB session 已经关了，于是报
+  「Method 'close()' can't be called here」，标记就留在 "auto_compact" 上。
+  实测后果比原先预计的更重：收尾轮不是「照常完成」，而是**挂住不返回**（20s 判红）。
+  这条断言就是这个缺口的覆盖：产品侧在 abort 前显式清标记之后，本题应自然变绿。
+  修产品是单独一条 PR 的事（评测只钉契约、不改产品，见设计 §6）；在那之前本题
+  以红色形式**记录**这个缺口，而不是把 expect 改松让报告好看（设计 §8 禁止）。

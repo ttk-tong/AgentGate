@@ -1,0 +1,28 @@
+id: D5-T01
+dimension: subagent
+layer: twist
+title: 一轮两个 spawn 并行 fan-out
+note: |
+  spawn_agent 是 is_read_only + is_concurrency_safe → 两次调用归入同一并发批
+  并行派发。mutates_context=True 只影响 mutation 的落库时机（批末按模型原始
+  顺序串行应用），不影响并发性——ToolSpec.concurrency_safe() 只看前两个标志。
+
+  repeats=5：并行 + 共享 AsyncSession 是竞态高发处（并发子 agent 若各自写库就会
+  两个协程同用一个 session）。跑一次绿说明不了什么。
+path: messages
+repeats: 5
+input:
+  content: "并行 [[tool:spawn_agent task=第一件事 | spawn_agent task=第二件事]]"
+expect:
+  http_status: 200
+  stop_reason: completed
+  tools:
+    - name: spawn_agent
+      arguments: {task: 第一件事}
+      ok: true
+    - name: spawn_agent
+      arguments: {task: 第二件事}
+      ok: true
+  max_tool_calls: 2
+  projection_len: 4
+  min_output_tokens: 1

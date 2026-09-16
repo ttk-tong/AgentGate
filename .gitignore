@@ -25,3 +25,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+# 评测报告：markdown 表进库（evals/reports/latest.md），原始 json 不进——
+# 里面的耗时受本机负载影响，进库只会制造无意义的 diff。
+evals/reports/raw-*.json

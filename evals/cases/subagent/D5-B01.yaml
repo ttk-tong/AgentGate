@@ -1,0 +1,24 @@
+id: D5-B01
+dimension: subagent
+layer: basic
+title: 委派一个子 agent，用量冒泡且过程不污染父
+note: |
+  三件事一起钉：
+  1. spawn 成功；
+  2. 父投影仍是 4 条（u / a+tool_use / tool_result / a）——子 agent 的中间消息
+     走 sidechain，不进父主链。这是「委派不污染上下文」的可测形式；
+  3. 父 usage 计入子用量。_absorb_subagent_usage 从 meta["usage"] 聚合，含整棵
+     子树。阶段 7 这里恒为 0（子烧了 token 父报 0），所以这条断言是防回归的。
+path: messages
+input:
+  content: "拆一下 [[tool:spawn_agent task=只回一句话]]"
+expect:
+  http_status: 200
+  stop_reason: completed
+  tools:
+    - name: spawn_agent
+      arguments: {task: 只回一句话}
+      ok: true
+  max_tool_calls: 1
+  projection_len: 4
+  min_output_tokens: 1

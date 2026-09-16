@@ -1,0 +1,30 @@
+id: D1-T02
+dimension: tools
+layer: twist
+title: 读写混合，写工具单独串行成批
+note: |
+  设计文档原写「便签事件落 DAG」不准：note_append 的副作用落在
+  session.meta["notes"]（session_store.append_note），DAG 里只有 tool_result。
+  所以本题的写侧断言用 session_notes。
+
+  分批顺序（kb_search 进并发批、note_append 单独串行批）由 partition_tool_calls
+  保证，但 execute_batched 按**原始顺序**返回结果 → 从结果上看不出批次。要真钉
+  顺序需要 executor 内部埋点，属于观测缺口，这里不编断言，只钉「都成功 + 步数 2
+  + 副作用真落库」。
+path: messages
+input:
+  content: "[[tool:kb_search query=tool | note_append text=记下分批规则]]"
+expect:
+  http_status: 200
+  stop_reason: completed
+  tools:
+    - name: kb_search
+      arguments: {query: tool}
+      ok: true
+      result_contains: ["只读并行"]
+    - name: note_append
+      arguments: {text: 记下分批规则}
+      ok: true
+  max_tool_calls: 2
+  projection_len: 4
+  session_notes: ["记下分批规则"]

@@ -1,0 +1,17 @@
+id: D1-B01
+dimension: tools
+layer: basic
+title: 纯文本不该调工具
+note: |
+  烟题。同时是 D1 的地板：一旦这题红了，说明「不需要工具时也在调工具」，
+  后面所有工具题的通过都不可信。
+path: messages
+input:
+  content: 你好
+expect:
+  http_status: 200
+  stop_reason: completed
+  tools: []          # 空列表 = 必须一次都不调；写 null 才是不检查
+  projection_len: 2  # user + assistant
+  reply_contains:
+    - 你好

@@ -1,0 +1,23 @@
+id: D1-H01
+dimension: tools
+layer: hard
+title: 缺必填参数要优雅失败
+note: |
+  weather 的 required 是 [city]，缺参在 BaseTool.validate_input 被挡，
+  tool_executor._err 折成 ok=false + content={"error","code"} 回填给模型，
+  Loop 不该崩。这是「工具错误 ≠ 请求错误」的地板题。
+
+  另外这题顺带钉住 no_orphan_tool_use：参数校验失败也必须配对回填，
+  否则下一轮投影就带着孤儿 tool_use 去打 provider，会拿到 400 且永久复现。
+path: messages
+input:
+  content: "[[tool:weather]]"
+expect:
+  http_status: 200
+  stop_reason: completed
+  tools:
+    - name: weather
+      ok: false
+      error_contains: ["invalid_args", "missing required"]
+  max_tool_calls: 1
+  projection_len: 4

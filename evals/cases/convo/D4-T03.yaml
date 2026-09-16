@@ -1,0 +1,24 @@
+id: D4-T03
+dimension: convo
+layer: twist
+title: 文件引用进上下文，snapshot 不进投影
+note: |
+  这题一次钉三件事：
+  1. 引用被解析并落了快照（reference_ids 非空）；
+  2. 引用正文进了 user 消息（模型看得见）；
+  3. snapshot 事件不进投影——projection_len 仍是 2（u/a）。第 3 条是关键：
+     snapshot 若进投影，引用正文会在上下文里出现两次，token 白烧一倍。
+path: messages
+input:
+  content: 这个文件讲了什么
+  references:
+    - ref_type: file
+      ref_uri: evals/fixtures/sandbox/hello.txt
+      render_mode: inline
+expect:
+  http_status: 200
+  stop_reason: completed
+  tools: []
+  min_reference_ids: 1
+  projection_len: 2
+  event_kind_counts: {snapshot: 1}

@@ -1,0 +1,30 @@
+id: D5-H01
+dimension: subagent
+layer: hard
+title: 超过扇出上限，那一次被拒且已派发的不受影响
+note: |
+  env 把 SUBAGENT_MAX_PER_RUN 调到 1，用两次 spawn 就能测到 fan_out_exceeded。
+  不这么做就得在题本里灌 7 次 spawn 去凑默认上限（6），题目会变慢且读不懂。
+  runner 跑完会还原环境变量并清 settings 缓存。
+
+  断言的重点是**部分成功**：第一次 ok=true，第二次 ok=false 且错误信息可识别为
+  扇出超限。计数只在放行时递增（try_claim 的注释写明），所以被拒的那次不会再
+  吃掉额度——如果哪天改成先扣再判，这题会红。
+path: messages
+env:
+  SUBAGENT_MAX_PER_RUN: "1"
+input:
+  content: "并行 [[tool:spawn_agent task=第一件事 | spawn_agent task=第二件事]]"
+expect:
+  http_status: 200
+  stop_reason: completed
+  tools:
+    - name: spawn_agent
+      arguments: {task: 第一件事}
+      ok: true
+    - name: spawn_agent
+      arguments: {task: 第二件事}
+      ok: false
+      error_contains: ["派发次数已用尽"]
+  max_tool_calls: 2
+  projection_len: 4

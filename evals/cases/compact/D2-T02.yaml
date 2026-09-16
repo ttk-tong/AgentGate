@@ -1,0 +1,59 @@
+id: D2-T02
+dimension: compact
+layer: twist
+title: 无可回收项时升级到全量摘要：边界断父、逻辑父留档
+path: messages/stream
+
+# 6 轮纯文本铺垫，一个工具都不调。这是本题的关键前提：主链上没有任何工具结果
+# → plan_microcompact 返回空 → 选层必须降级到 auto_compact。
+# 铺垫文本里刻意不含 [[tool:...]] 字面量：全量摘要会把历史原文喂给摘要模型，
+# Mock 见到指令就会去调工具而不产出文本 → 空摘要 → CompactionError，
+# 题目会以一个与被测量无关的理由变红（实测过，见 note）。
+preamble:
+  - "我们在做一个订单导入功能，数据源是 CSV。"
+  - "字段映射按表头做，缺列就报错，不要静默补空。"
+  - "分批提交，每批一千行。"
+  - "失败的批次要能单独重跑，不要整单回滚。"
+  - "进度写日志，每批一条。"
+  - "先做到这里，我确认一下。"
+
+compact:
+  # Mock 窗口 200k，默认阈值灌不到。压到必然超的水位，让「触发」成为可控前提。
+  threshold_tokens: 100
+
+input:
+  content: "继续，把重跑那块讲清楚"
+
+expect:
+  http_status: 200
+  stop_reason: completed
+  # 选层：没有可回收工具结果 → 必须升级到全量摘要。
+  compact_layer: auto_compact
+  # 边界的两个指针：parent_id 断前史（投影回溯到此即停），logical_parent_id 留
+  # 真实前史（回放/审计还要用）。只断一个都不够：只断 parent 会丢审计链，
+  # 只留 logical_parent 等于没切、前史照旧全进上下文。
+  boundary_cuts_history: true
+  event_kind_counts:
+    compact_boundary: 1
+  # 压缩后的投影 = 摘要(user) + 保留的近因尾部 2 条 + 本轮 assistant 回复。
+  # KEEP_TAIL_EVENTS=2 是产品常量；钉这个数字就是钉「切了、且只保留近因」——
+  # 不钉的话，边界插进去但前史仍全量进上下文（切失败）也是绿的。
+  projection_len: 4
+
+# 收尾轮跑在**真实阈值**上（阈值补丁只包被测那一轮），所以它不会再触发压缩。
+# 它要证明的是：切完历史之后会话仍然可用，模型接着摘要往下答。
+followup:
+  content: "好，那就这样"
+  http_status: 200
+  stop_reason: completed
+
+note: >-
+  设计 §D2-T02。断言分三层：compact_layer 钉选层降级，boundary_cuts_history 钉
+  边界的两个指针，projection_len=4 钉「前史真的不再进上下文」。
+  dag_parent_chain 照常开着：boundary.parent_id=None 是合法的根，压缩不该让这条
+  不变式变红——这点本身值得钉一遍。
+  已知边界（实测发现，非产品缺陷但值得记）：auto_compact 把历史**原文**喂给摘要
+  模型，历史里的文本对摘要模型而言就是指令。本题在 Mock 上的表现是「历史含
+  [[tool:...]] → 摘要模型改去调工具 → 空摘要 → CompactionError」；换成真实模型，
+  历史里一句「忽略前面的指令」同样会作用在摘要这一跳上。摘要提示词目前没有对历史
+  正文做定界/转义（compactor._summary_prompt 直接拼接），这是一个真实的注入面。

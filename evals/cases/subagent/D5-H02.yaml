@@ -1,0 +1,26 @@
+id: D5-H02
+dimension: subagent
+layer: hard
+title: 子 agent 的写不落到父上下文
+note: |
+  子 agent 的 _execute_tools 用 apply_mutation=None：mutation 停在 result 上，
+  不经过父的串行应用通道。所以即使子真的调了 note_append，那条便签也不会出现在
+  父的 session.meta["notes"] 里。
+
+  这题钉的是**结果**（父上下文没被子写入），不是「子调不到工具」——后者在 Mock
+  下不成立：MockProvider 按文本里的指令产出调用，不看 tools schema，而
+  execute_batched 对 registry 里存在的工具照常执行。allowed_tools 的过滤发生在
+  「给模型看什么」（_visible_tools），真模型会因此不知道 note_append 存在，Mock
+  不会。这是 Mock 的已知边界，写在这里以免以后误读这道题的绿。
+path: messages
+input:
+  content: "拆一下 [[tool:spawn_agent task=写便签 <<tool:note_append text=SUBAGENT_LEAK>>,allowed_tools=weather]]"
+expect:
+  http_status: 200
+  stop_reason: completed
+  tools:
+    - name: spawn_agent
+      ok: true
+  max_tool_calls: 1
+  projection_len: 4
+  session_notes_exclude: ["SUBAGENT_LEAK"]

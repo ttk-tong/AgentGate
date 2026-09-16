@@ -1,0 +1,48 @@
+id: D7-H01
+dimension: resilience
+layer: hard
+title: 降级链耗尽：主模型与所有备用模型都过载 → provider_unavailable
+path: messages/stream
+
+# 主模型 mock-down 与唯一备用 mock-down2 都在过载集合里：loop 走完整条降级链，每跳
+# 都过载，链耗尽 → _abort(STOP_PROVIDER_UNAVAILABLE)。这条路径 yield 一个 done 帧
+# （stop_reason=provider_unavailable, retriable=true），HTTP 仍是 200——不是 503。
+# 两条形状不同的失败路径见 note。
+env:
+  DEFAULT_MODEL: mock-down
+  FALLBACK_MODELS: mock-down2
+resilience:
+  overload_models: [mock-down, mock-down2]
+
+input:
+  content: "在吗"
+
+expect:
+  http_status: 200
+  stop_reason: provider_unavailable
+  # 降级链耗尽是「上游暂时不可用」，对客户端可重试——retriable 必须 true，客户端据此
+  # 退避重试而非当永久失败放弃。retriable 只在 SSE done 帧上可见，故本题走 stream 路径
+  # （非流式响应体没有 retriable 字段，schema 校验会拦下在非流式上写 retriable）。
+  retriable: true
+  # 全程没有一次成功产出，更不该有工具调用。
+  max_tool_calls: 0
+
+note: >-
+  设计 §D7-H01。这里钉的是「降级链耗尽」在**现有 chat.py 行为**下的真实契约，按设计稿
+  「以现有行为为准、评测钉住而非修改」的原则来。仓库里有两条形状不同的失败路径，易混：
+  (1) 降级链耗尽——loop 在过载分支发现 model_fallbacks_used 已达 len(fallback_models)，
+      走 _abort(STOP_PROVIDER_UNAVAILABLE)，**yield 一个 done 帧**（不是抛异常）。
+      非流式 → HTTP 200 + stop_reason=provider_unavailable；流式 → done 帧再带
+      retriable=true（events.py 按 is_retriable(stop_reason) 自动填，provider_unavailable
+      在 RETRIABLE 表里为 True）。本题测的就是这条。
+  (2) HTTP 503——只有 ProviderUnavailable 异常**未被捕获地冒泡**到 app/api/errors.py
+      的处理器时才出现。但 stream_with_retry 在 overloaded 标记下会把 ProviderUnavailable
+      转成 ProviderOverloaded（llm_call.py），而 loop 只捕获 ProviderOverloaded——所以
+      过载导致的耗尽永远走 (1)，落不到 503。503 是「非过载原因的不可用」（如熔断跳过了
+      唯一 target）才有的路径，本题的过载注入触发不了它。
+  故本题按 (1) 钉 stop_reason=provider_unavailable + retriable=true，是对「降级链耗尽」
+  最忠实的读法；503 那条留给本注释说明，不在断言里。
+  熔断相互作用：本题在 "mock" provider 上记 2 次失败（mock-down、mock-down2 各一次），
+  fail_threshold=5；且 load_all_cases 按 id 排序，同一 run 里排在后面的 D7-T01 成功会
+  on_success 归零，互不干扰。唯一隐患是**单独反复只跑 H01**（无成功轮复位）时计数会
+  向 5 累积——正常的全量/整维跑不会遇到；验证前对评测 Redis 做一次 flush 即可彻底规避。

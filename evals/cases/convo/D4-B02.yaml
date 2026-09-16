@@ -1,0 +1,14 @@
+id: D4-B02
+dimension: convo
+layer: basic
+title: 未知 run_id 取消返回 202（幂等表达意图）
+note: |
+  202 不是「已停住」，是「意图已记下」。取消是协作式的，真正停止发生在运行的
+  下一个检查点。未知/已结束的 run 也返回 202：客户端点停止时 run 可能刚好自然
+  结束，让它 404 会在 UI 上显示一个假错误。
+probe:
+  method: POST
+  path: /v1/sessions/{session_id}/runs/no-such-run/cancel
+expect:
+  http_status: 202
+invariants: []

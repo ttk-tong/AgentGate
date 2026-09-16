@@ -1,0 +1,24 @@
+id: D4-T04
+dimension: convo
+layer: twist
+title: 默认 interrupt 策略抢占旧 run
+note: |
+  两个预置动作都是必需的，缺一个这题就测不到东西：
+  - preempt：伪造 run:current。非流式路径**从不**写这个键（mark_current 只在
+    chat.py 的流式路径调用），不造的话 preempt_active_run 是静默 no-op。
+  - hold_lock：占住会话锁 300ms。零延迟 Mock 下不占锁就没有「活跃 run」可抢，
+    第二句直接拿到空闲锁返回 200——那样也是绿，但绿得毫无意义。
+
+  断言落在「旧 run 被写了 superseded 取消标记」上，而不只是第二句 200。
+path: messages
+repeats: 5
+input:
+  content: 第二句
+actions:
+  - kind: preempt
+  - kind: hold_lock
+    hold_ms: 300
+expect:
+  http_status: 200
+  stop_reason: completed
+  preempted_run_cancelled: true

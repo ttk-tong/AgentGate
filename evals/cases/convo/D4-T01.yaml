@@ -1,0 +1,31 @@
+id: D4-T01
+dimension: convo
+layer: twist
+title: 运行中取消，且会话不报废
+note: |
+  本面最值钱的一题。取消路径补孤儿是全仓最硬的不变式——评测集若不钉这条，
+  D4 就只是在测 HTTP 状态码。
+
+  no_orphan_tool_use 检查的是**原始事件**而不是投影：load_projection 里会调
+  _close_orphan_tool_calls 自动补齐，在投影上查孤儿永远是真，那是假断言。
+
+  followup 是本题的另一半：取消之后同一 session 还能正常发消息，才叫「打断」
+  而不是「打坏」。
+path: messages/stream
+mock_delay_ms: 60
+repeats: 5
+input:
+  content: "[[tool:weather city=北京 | kb_search query=loop]]"
+actions:
+  - kind: cancel
+expect:
+  http_status: 200
+  stop_reason: cancelled_by_user
+followup:
+  content: 取消之后还能说话吗
+  http_status: 200
+  stop_reason: completed
+invariants:
+  - no_orphan_tool_use
+  - dag_parent_chain
+  - stop_reason_in_enum

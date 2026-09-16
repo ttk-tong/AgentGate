@@ -1,0 +1,26 @@
+id: D4-T02
+dimension: convo
+layer: twist
+title: 运行中引导，引导内容不丢
+note: |
+  引导不终止 run，只追加信息改变后续行为。断言两件事：客户端收到 steered 确认，
+  且引导文本进了落库历史（resume/replay 时不丢）——只看 steered 事件不够，
+  那只证明「服务端收到了」，不证明「进了上下文」。
+path: messages/stream
+mock_delay_ms: 60
+repeats: 5
+input:
+  content: "[[tool:weather city=北京 | kb_search query=loop]]"
+actions:
+  - kind: steer
+    text: 改用中文
+    mode: append
+expect:
+  http_status: 200
+  stop_reason: completed
+  events_include: [steered]
+  steered_contains: ["改用中文"]
+invariants:
+  - no_orphan_tool_use
+  - dag_parent_chain
+  - stop_reason_in_enum

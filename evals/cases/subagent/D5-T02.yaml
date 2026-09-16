@@ -1,0 +1,27 @@
+id: D5-T02
+dimension: subagent
+layer: twist
+title: 子 agent 再 spawn 被深度闸拦住，父不崩
+note: |
+  嵌套指令用 `<<tool:...>>` 转义（见 evals/provider.py）：MockProvider 的指令
+  正则是非贪婪的，直接写 [[tool:...]] 嵌套会被外层截断成
+  `task="[[tool:spawn_agent task=孙子"`，子 agent 什么也不会调，题目变成假绿。
+
+  subagent_max_depth 默认 1 → 子（depth=1）再派发时 depth >= max_depth，
+  try_claim 返回 depth_exceeded。关键在于这个拒绝走的是 check_permissions →
+  PermissionDecision.deny → executor 折成 error 结果，模型看得懂；放 call 里抛
+  异常只会变成一条错误字符串。
+
+  父侧断言：spawn 本身 ok=true（子跑完了，只是它的再派发被拒），父仍 completed。
+  子内部的 deny 不该冒泡成父的失败。
+path: messages
+input:
+  content: "拆一下 [[tool:spawn_agent task=再拆一层 <<tool:spawn_agent task=孙子任务>>]]"
+expect:
+  http_status: 200
+  stop_reason: completed
+  tools:
+    - name: spawn_agent
+      ok: true
+  max_tool_calls: 1
+  projection_len: 4

@@ -1,0 +1,26 @@
+id: D4-H02
+dimension: convo
+layer: hard
+title: reject 策略撞锁 409，锁释放后可恢复
+note: |
+  reject 是显式的「拒绝新消息」策略：撞上活跃 run 就 409，不抢占。
+  hold_ms 不设 → 占锁直到被测请求结束，所以 409 是确定的，不是抢时序抢来的。
+
+  followup 是本题的另一半：409 只是当下忙，不是会话坏了。锁释放后第三句必须
+  能过——一个 409 之后就永久拒绝的会话，比抢占更糟。
+path: messages
+repeats: 5
+input:
+  content: 第二句
+actions:
+  - kind: set_policy
+    policy: reject
+  - kind: hold_lock
+expect:
+  http_status: 409
+followup:
+  content: 第三句
+  http_status: 200
+  stop_reason: completed
+invariants:
+  - zero_side_effect_on_4xx

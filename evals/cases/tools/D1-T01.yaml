@@ -1,0 +1,26 @@
+id: D1-T01
+dimension: tools
+layer: twist
+title: 两个只读工具同批并发
+note: |
+  两个都是 is_read_only + is_concurrency_safe → executor 归入同一并发批。
+  **完成顺序不作为断言**：并发批没有顺序保证，钉顺序等于给自己埋一道随机红题。
+  钉的是「集合相等」+「步数恰好 2」（没有重试、没有空转）。
+  repeats=5：这题的价值就在并发，跑一次证明不了稳定。
+path: messages
+repeats: 5
+input:
+  content: "[[tool:weather city=北京 | kb_search query=loop]]"
+expect:
+  http_status: 200
+  stop_reason: completed
+  tools:
+    - name: weather
+      arguments: {city: 北京}
+      ok: true
+    - name: kb_search
+      arguments: {query: loop}
+      ok: true
+  max_tool_calls: 2
+  # 并行兄弟按 message_id 归并成一条 assistant + 一条 tool 消息
+  projection_len: 4

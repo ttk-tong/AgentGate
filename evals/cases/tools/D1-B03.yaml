@@ -1,0 +1,20 @@
+id: D1-B03
+dimension: tools
+layer: basic
+title: 检索工具命中桩语料
+note: |
+  kb_search 把 query 转小写后做子串匹配，"loop" 命中固定桩文档。
+  断言结果非空而不是断言具体条数：桩语料以后可能加条目，钉条数会让题本变脆。
+path: messages
+input:
+  content: "[[tool:kb_search query=loop]]"
+expect:
+  http_status: 200
+  stop_reason: completed
+  tools:
+    - name: kb_search
+      arguments: {query: loop}
+      ok: true
+      result_contains: ["状态机"]
+  max_tool_calls: 1
+  projection_len: 4

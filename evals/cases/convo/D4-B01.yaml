@@ -1,0 +1,15 @@
+id: D4-B01
+dimension: convo
+layer: basic
+title: 无活跃 run 时按会话取消返回 404
+note: |
+  404 在这里是有信息量的：`/sessions/{id}/cancel` 靠 run:current 定位，定位不到
+  就是真的没有可取消的运行。与下一题（按 run_id 取消一律 202）刻意不同——
+  两个接口的语义不同，评测把这个差异钉住，避免以后被「统一成 202」抹平。
+probe:
+  method: POST
+  path: /v1/sessions/{session_id}/cancel
+expect:
+  http_status: 404
+invariants:
+  - zero_side_effect_on_4xx

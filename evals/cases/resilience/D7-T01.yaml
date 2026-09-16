@@ -1,0 +1,42 @@
+id: D7-T01
+dimension: resilience
+layer: twist
+title: 模型降级：主模型过载，自动切到备用模型并成功
+path: messages
+
+# 主模型 mock-primary 一律过载（ProviderOverloaded），Loop 走降级链切到 fallback
+# mock-backup；备用不在过载集合里，于是这一轮成功产出。被测的是「过载→降级→成功」
+# 这条产品恢复路径（agent_loop 的 model_fallbacks_used 计数 + current_model 切换）。
+env:
+  DEFAULT_MODEL: mock-primary
+  FALLBACK_MODELS: mock-backup
+resilience:
+  overload_models: [mock-primary]
+
+input:
+  content: "你好"
+
+expect:
+  http_status: 200
+  stop_reason: completed
+  # 纯文本问候，不该触发任何工具。
+  max_tool_calls: 0
+  # 关键观测点：Mock 的回声里嵌了 model 名（[mock:{request.model}]）。降级后真正
+  # 产出那一轮跑在 mock-backup 上，所以回声必须是 [mock:mock-backup]——这直接证明
+  # 「切到备用模型」确实发生了，而不是主模型自己恢复了。
+  reply_contains: ["[mock:mock-backup]"]
+  # 主模型从头到尾只抛过载、没产出过任何文本，它的回声绝不该出现。
+  reply_excludes: ["[mock:mock-primary]"]
+
+note: >-
+  设计 §D7-T01。降级的可观测性靠 MockProvider 的回声里嵌的 model 名：
+  reply=f"[mock:{request.model}] 收到：…"，而 request.model 取 LoopState.current_model。
+  主模型过载 → loop 把 current_model 换成 fallback → 这一轮请求带着 mock-backup 发出
+  → 回声就是 [mock:mock-backup]。所以 reply_contains/[mock:mock-backup] 与
+  reply_excludes/[mock:mock-primary] 两条合起来，钉死了「降级真的切了模型、且响应是
+  备用模型产出的」，比只看 stop_reason=completed（主模型若自己恢复也会 completed）强。
+  过载注入点在 provider.stream 产出任何 chunk 之前——loop 只有「本轮尚未 emit」时才降级，
+  emit 之后再失败只能报错。overload_models 按 request.model 判定，降级换名后同一 provider
+  实例对 mock-backup 不再过载，这才让「切过去就恢复」成立。
+  熔断相互作用：本题在 "mock" provider 上记 1 次失败（mock-primary 那跳）然后 mock-backup
+  成功 → on_success 归零，fail_threshold=5，不累积。

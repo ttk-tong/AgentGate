@@ -1,0 +1,36 @@
+id: D3-T01
+dimension: memory
+layer: twist
+title: 跨会话召回：新开会话、同一 external_user，记忆进 prompt
+path: messages
+
+# 写入发生在**另一个会话**（seed），被测轮新开会话、同一 external_user。
+# 这是本题的关键：新会话没有任何对话历史，偏好能出现在 prompt 里就只可能来自
+# 跨会话的长期记忆召回——测的是「记忆」，不是「上下文」。
+external_user: eval-D3-T01-user
+seed:
+  - external_user: eval-D3-T01-user
+    content: "记住 [[tool:remember content=用户喜欢简体中文,kind=preference]]"
+
+input:
+  content: "我喜欢用什么语言交流"
+
+expect:
+  http_status: 200
+  stop_reason: completed
+  # 被测轮是纯文本问句，不该触发任何工具。
+  max_tool_calls: 0
+  # 召回只注入 system prompt（PromptComposer → <memory> 块），Mock 不回显它。
+  # 观测点是 provider 那一轮实际收到的 system——记忆块里应含 seed 写入的偏好。
+  recalled_prompt_contains: ["用户喜欢简体中文"]
+  # 交叉验证：这条记忆确实在该 external_user 的 user scope 里（跨会话可见）。
+  memory_user_scope_contains: ["用户喜欢简体中文"]
+
+note: >-
+  设计 §D3-T01。召回的可观测性在本仓库是个真问题：记忆只进 system prompt，
+  没有读取 API，Mock 又只回显用户文本、mark_used 也不落库（composer 不传 now），
+  所以 use_count 都看不出召回。断言因此打在 provider 收到的 system 边界上
+  （recalled_prompt_contains），这是「记忆真被喂给了模型」最直接的证据。
+  写入放在独立 seed 会话、被测轮新开会话，是为了让「同一 external_user 换个会话仍能
+  召回」成为唯一可能的解释——同会话铺垫测的是对话历史，证明不了记忆。
+  两个会话同属 _ANON_TENANT，跨会话可见性完全由 scope_key=external_user 相同提供。

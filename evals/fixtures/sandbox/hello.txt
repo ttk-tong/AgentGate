@@ -1,0 +1,2 @@
+AGENTGATE_EVAL_FIXTURE_OK
+这是评测夹具文件。file_read 读到它即证明沙箱内相对路径可用。

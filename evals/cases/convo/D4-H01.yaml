@@ -1,0 +1,21 @@
+id: D4-H01
+dimension: convo
+layer: hard
+title: 引用不存在的消息 → 404 且零副作用
+note: |
+  zero_side_effect_on_4xx 是这题的重点：解析失败必须在落库任何 snapshot 之前
+  就返回。若先落快照再失败，会话里会留下一条指向不存在内容的快照事件，
+  之后每次回放都带着它。
+
+  引用解析刻意留在请求作用域（chat.py 的注释写明了理由）：挪进后台任务就只能
+  退化成流内 error 帧，客户端拿到 200 + 错误帧，重试难写。这题钉的就是那个决定。
+path: messages
+input:
+  content: 看看这条消息
+  references:
+    - ref_type: message
+      ref_uri: 00000000-0000-0000-0000-000000000000
+expect:
+  http_status: 404
+invariants:
+  - zero_side_effect_on_4xx

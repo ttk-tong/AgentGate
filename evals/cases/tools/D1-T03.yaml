@@ -1,0 +1,20 @@
+id: D1-T03
+dimension: tools
+layer: twist
+title: 多轮上下文累积，历史不丢
+note: |
+  钉的是投影长度与角色交替，不是「模型理解了第一句」——Mock 不理解任何东西。
+  投影 4 条（u/a/u/a）证明第二轮的 prompt 里确实带着第一轮，历史没被覆盖也没被
+  重复计入。这是所有多轮能力的地板。
+path: messages
+preamble:
+  - 第一句
+input:
+  content: 第二句
+expect:
+  http_status: 200
+  stop_reason: completed
+  tools: []
+  projection_len: 4
+  reply_contains: ["第二句"]
+  reply_excludes: ["第一句"]  # 回声只回本轮，串轮就说明投影拼错了

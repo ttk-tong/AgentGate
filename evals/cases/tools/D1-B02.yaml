@@ -1,0 +1,22 @@
+id: D1-B02
+dimension: tools
+layer: basic
+title: 单个只读工具，参数正确传达
+note: |
+  设计文档原写「reply 含晴、28」，实测是错的：MockProvider 的回声只回用户原文
+  （剥掉 [[tool:...]] 指令），不回工具结果。所以「工具真干活了」必须在
+  tool_result 块上断言。
+path: messages
+input:
+  content: "[[tool:weather city=北京]]"
+expect:
+  http_status: 200
+  stop_reason: completed
+  tools:
+    - name: weather
+      arguments: {city: 北京}
+      ok: true
+      result_contains: ["晴", "28"]
+  max_tool_calls: 1
+  # user / assistant(tool_use) / tool(result) / assistant(收尾) = 4
+  projection_len: 4

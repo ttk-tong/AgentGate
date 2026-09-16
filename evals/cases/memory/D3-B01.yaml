@@ -1,0 +1,36 @@
+id: D3-B01
+dimension: memory
+layer: basic
+title: remember 写入长期记忆：user scope 能读到
+path: messages
+
+# remember 是写工具（有副作用），产出 ContextMutation 交给 Loop 的应用器落库。
+# scope 固定 user、scope_key 取会话 external_user（工具本身不碰用户标识，防越权）。
+# Mock 的参数解析按 `,` 切分，所以 content 与 kind 之间是逗号，不是空格
+# （设计稿里写的空格分隔会被解析成 content="…… kind=preference"）。
+input:
+  content: "记一下我的偏好 [[tool:remember content=用户偏好简体中文回答,kind=preference]]"
+
+expect:
+  http_status: 200
+  stop_reason: completed
+  tools:
+    - name: remember
+      ok: true
+      # Mock 不回显工具结果，「记住了什么」只能在结果块上断言。
+      result_contains: ["用户偏好简体中文回答"]
+  # 不许空转：一次 remember 就够。
+  max_tool_calls: 1
+  # 真正的落库断言：直接查 DbMemoryStore 的 user scope（按会话自身 tenant + external_user）。
+  # 没有记忆读取 API，reply 也不含记忆内容，所以这是唯一能证明「写进去了」的观测点。
+  memory_user_scope_contains: ["用户偏好简体中文回答"]
+
+note: >-
+  设计 §D3-B01。断言分两处：tools[remember].result_contains 钉「工具确实带着内容跑了」，
+  memory_user_scope_contains 钉「内容确实落进了 user scope 记忆」。后者直接查库而非
+  走 API——记忆召回只注入 system prompt、没有独立读取端点，且 Mock 只回显用户文本，
+  reply 里看不到记忆。查询用的 tenant_id 取会话自身的（匿名会话固定归到 _ANON_TENANT），
+  与 _apply_remember 写入、composer 召回三处一致，所以查得到刚写的这条。
+  已知边界：_apply_remember 只在有 external_user（非匿名）时写入，本题会话带
+  external_user=eval-D3-B01，不是匿名，所以会真的落库——匿名会话下 remember 是静默
+  no-op，那是另一道题（若要覆盖需单独建匿名会话断言「没写」）。
